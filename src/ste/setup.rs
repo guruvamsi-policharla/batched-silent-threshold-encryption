@@ -1,8 +1,11 @@
 use ark_ec::pairing::PairingOutput;
 // use crate::utils::{lagrange_coefficients, transpose};
-use crate::encryption::Ciphertext;
-use crate::kzg::{PowersOfTau, KZG10};
-use crate::utils::lagrange_poly;
+use crate::ste::{
+    encryption::Ciphertext,
+    kzg::{PowersOfTau, KZG10},
+    utils::lagrange_poly,
+};
+
 use ark_ec::{pairing::Pairing, PrimeGroup};
 use ark_ff::Field;
 use ark_poly::{

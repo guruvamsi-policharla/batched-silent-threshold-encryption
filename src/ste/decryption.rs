@@ -9,7 +9,7 @@ use ark_poly::{
 use ark_std::{One, Zero};
 use std::ops::Div;
 
-use crate::{
+use crate::ste::{
     encryption::Ciphertext,
     kzg::{PowersOfTau, KZG10},
     setup::AggregateKey,
@@ -150,7 +150,7 @@ pub fn agg_dec<E: Pairing>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
+    use crate::ste::{
         encryption::encrypt,
         kzg::KZG10,
         setup::{PublicKey, SecretKey},

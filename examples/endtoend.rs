@@ -1,7 +1,7 @@
 use ark_ec::pairing::Pairing;
 use ark_poly::univariate::DensePolynomial;
 use ark_std::{end_timer, start_timer, UniformRand, Zero};
-use silent_threshold_encryption::{
+use silent_threshold_encryption::ste::{
     decryption::agg_dec,
     encryption::encrypt,
     kzg::KZG10,
@@ -17,7 +17,7 @@ use rayon::prelude::*;
 
 fn main() {
     let mut rng = ark_std::test_rng();
-    let n = 1 << 10; // actually n-1 total parties. one party is a dummy party that is always true
+    let n = 1 << 5; // actually n-1 total parties. one party is a dummy party that is always true
     let t: usize = 9;
     debug_assert!(t < n);
 

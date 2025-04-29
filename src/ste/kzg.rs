@@ -132,9 +132,7 @@ fn skip_leading_zeros_and_convert_to_bigints<F: PrimeField, P: DenseUVPolynomial
 }
 
 pub fn convert_to_bigints<F: PrimeField>(p: &[F]) -> Vec<F::BigInt> {
-    ark_std::cfg_iter!(p)
-        .map(|s| s.into_bigint())
-        .collect::<Vec<_>>()
+    p.iter().map(|s| s.into_bigint()).collect::<Vec<_>>()
 }
 
 fn check_degree_is_too_large(degree: usize, num_powers: usize) -> Result<(), Error> {

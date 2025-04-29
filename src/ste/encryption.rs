@@ -1,6 +1,6 @@
 use std::ops::Mul;
 
-use crate::{kzg::PowersOfTau, setup::AggregateKey};
+use crate::ste::{kzg::PowersOfTau, setup::AggregateKey};
 use ark_ec::{
     pairing::{Pairing, PairingOutput},
     PrimeGroup,
@@ -95,7 +95,7 @@ pub fn encrypt<E: Pairing>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
+    use crate::ste::{
         kzg::KZG10,
         setup::{PublicKey, SecretKey},
     };
