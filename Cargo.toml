@@ -11,9 +11,10 @@ ark-ff = { version = "0.5.0" }
 ark-poly = { version = "0.5.0" }
 ark-bls12-381 = { version = "0.5.0" }
 ark-serialize = { version = "0.5.0" }
-rand = { version = "0.9.0" }
-
+rand = { version = "0.9.1" }
+serde = { version = "1.0.130" }
 rayon = { version = "1.5.1" }
+bincode = { version = "1.3" }
 
 [features]
 asm = ["ark-ff/asm"]
@@ -35,4 +36,8 @@ harness = false
 
 [[bench]]
 name = "setup"
+harness = false
+
+[[bench]]
+name = "batch_eval"
 harness = false
