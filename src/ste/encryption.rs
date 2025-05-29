@@ -1,20 +1,31 @@
-use std::ops::Mul;
-
-use crate::ste::{kzg::PowersOfTau, setup::AggregateKey};
+use crate::ste::{aggregate::EncryptionKey, crs::CRS};
 use ark_ec::{
     pairing::{Pairing, PairingOutput},
     PrimeGroup,
 };
 use ark_serialize::*;
-use ark_std::{UniformRand, Zero};
+use ark_std::UniformRand;
+use std::ops::Mul;
 
-#[derive(CanonicalSerialize, CanonicalDeserialize, Clone)]
+use crate::utils::{ark_de, ark_se};
+use serde::{Deserialize, Serialize};
+
+#[derive(
+    Debug, CanonicalSerialize, CanonicalDeserialize, Serialize, Deserialize, Clone, PartialEq,
+)]
 pub struct Ciphertext<E: Pairing> {
+    #[serde(serialize_with = "ark_se", deserialize_with = "ark_de")]
     pub gamma_g2: E::G2,
+    #[serde(serialize_with = "ark_se", deserialize_with = "ark_de")]
     pub sa1: [E::G1; 2],
+    #[serde(serialize_with = "ark_se", deserialize_with = "ark_de")]
     pub sa2: [E::G2; 6],
-    pub enc_key: PairingOutput<E>, //key to be used for encapsulation
-    pub t: usize,                  //threshold
+    #[serde(serialize_with = "ark_se", deserialize_with = "ark_de")]
+    pub ct: Vec<PairingOutput<E>>, // key to be used for encapsulation (linearly homomorphic)
+    // #[serde(serialize_with = "ark_se", deserialize_with = "ark_de")]
+    // pub ct: Vec<u8>, //encrypted message
+    #[serde(serialize_with = "ark_se", deserialize_with = "ark_de")]
+    pub t: usize, //threshold
 }
 
 impl<E: Pairing> Ciphertext<E> {
@@ -22,14 +33,14 @@ impl<E: Pairing> Ciphertext<E> {
         gamma_g2: E::G2,
         sa1: [E::G1; 2],
         sa2: [E::G2; 6],
-        enc_key: PairingOutput<E>,
+        ct: Vec<PairingOutput<E>>,
         t: usize,
     ) -> Self {
         Ciphertext {
             gamma_g2,
             sa1,
             sa2,
-            enc_key,
+            ct,
             t,
         }
     }
@@ -37,27 +48,26 @@ impl<E: Pairing> Ciphertext<E> {
 
 /// t is the threshold for encryption and apk is the aggregated public key
 pub fn encrypt<E: Pairing>(
-    apk: &AggregateKey<E>,
+    ek: &EncryptionKey<E>,
     t: usize,
-    params: &PowersOfTau<E>,
+    crs: &CRS<E>,
+    gamma_g2: E::G2, // this should be hash_to_point(attestation_data)
+    m: &Vec<PairingOutput<E>>,
 ) -> Ciphertext<E> {
     let mut rng = ark_std::test_rng();
-    let gamma = E::ScalarField::rand(&mut rng);
-    let gamma_g2 = params.powers_of_h[0] * gamma;
 
-    let g = params.powers_of_g[0];
-    let h = params.powers_of_h[0];
+    let g = crs.powers_of_g[0];
+    let h = crs.powers_of_h[0];
 
     let mut sa1 = [E::G1::generator(); 2];
     let mut sa2 = [E::G2::generator(); 6];
 
-    let mut s: [E::ScalarField; 5] = [E::ScalarField::zero(); 5];
+    let s = (0..5)
+        .map(|_| E::ScalarField::rand(&mut rng))
+        .collect::<Vec<_>>();
 
-    s.iter_mut()
-        .for_each(|s| *s = E::ScalarField::rand(&mut rng));
-
-    // sa1[0] = s0*ask + s3*g^{tau^{t+1}} + s4*g
-    sa1[0] = (apk.ask * s[0]) + (params.powers_of_g[t + 1] * s[3]) + (params.powers_of_g[0] * s[4]);
+    // sa1[0] = s0*ask + s3*g^{tau^{t}} + s4*g
+    sa1[0] = (ek.ask * s[0]) + (crs.powers_of_g[t] * s[3]) + (crs.powers_of_g[0] * s[4]);
 
     // sa1[1] = s2*g
     sa1[1] = g * s[2];
@@ -66,10 +76,10 @@ pub fn encrypt<E: Pairing>(
     sa2[0] = (h * s[0]) + (gamma_g2 * s[2]);
 
     // sa2[1] = s0*z_g2
-    sa2[1] = apk.z_g2 * s[0];
+    sa2[1] = ek.z_g2 * s[0];
 
-    // sa2[2] = s0*h^tau + s1*h^tau
-    sa2[2] = params.powers_of_h[1] * (s[0] + s[1]);
+    // sa2[2] = s0*h^tau + s1*h^{tau^2}
+    sa2[2] = crs.powers_of_h[1] * s[0] + crs.powers_of_h[2] * s[1];
 
     // sa2[3] = s1*h
     sa2[3] = h * s[1];
@@ -77,17 +87,18 @@ pub fn encrypt<E: Pairing>(
     // sa2[4] = s3*h
     sa2[4] = h * s[3];
 
-    // sa2[5] = s4*h^{tau - omega^0}
-    sa2[5] = (params.powers_of_h[1] + apk.h_minus1) * s[4];
+    // sa2[5] = s4*h^{tau}
+    sa2[5] = (crs.powers_of_h[1]) * s[4];
 
-    // enc_key = s4*e_gh
-    let enc_key = apk.e_gh.mul(s[4]);
+    // ct = s4*e_gh + m[0]
+    // todo: encrypt the entire vector
+    let ct = vec![ek.e_gh.mul(s[4]) + m[0]];
 
     Ciphertext {
         gamma_g2,
         sa1,
         sa2,
-        enc_key,
+        ct,
         t,
     }
 }
@@ -96,35 +107,36 @@ pub fn encrypt<E: Pairing>(
 mod tests {
     use super::*;
     use crate::ste::{
-        kzg::KZG10,
-        setup::{PublicKey, SecretKey},
+        aggregate::AggregateKey,
+        crs::CRS,
+        setup::{LagPublicKey, SecretKey},
     };
-    use ark_poly::univariate::DensePolynomial;
-    use ark_std::UniformRand;
 
     type E = ark_bls12_381::Bls12_381;
     type G1 = <E as Pairing>::G1;
     type G2 = <E as Pairing>::G2;
-    type Fr = <E as Pairing>::ScalarField;
-    type UniPoly381 = DensePolynomial<<E as Pairing>::ScalarField>;
 
     #[test]
     fn test_encryption() {
         let mut rng = ark_std::test_rng();
         let n = 8;
-        let tau = Fr::rand(&mut rng);
-        let params = KZG10::<E, UniPoly381>::setup(n, tau.clone()).unwrap();
+        let crs = CRS::new(n, &mut rng);
 
         let mut sk: Vec<SecretKey<E>> = Vec::new();
-        let mut pk: Vec<PublicKey<E>> = Vec::new();
+        let mut pk: Vec<LagPublicKey<E>> = Vec::new();
 
         for i in 0..n {
-            sk.push(SecretKey::<E>::new(&mut rng));
-            pk.push(sk[i].get_pk(0, &params, n))
+            sk.push(SecretKey::<E>::new(&mut rng, i));
+            pk.push(sk[i].get_lagrange_pk(i, &crs))
         }
 
-        let ak = AggregateKey::<E>::new(pk, &params);
-        let ct = encrypt::<E>(&ak, 2, &params);
+        let (_ak, ek) = AggregateKey::<E>::new(pk, &crs);
+
+        let gamma_g2 = G2::rand(&mut rng);
+
+        let m = vec![PairingOutput::<E>::generator()];
+
+        let ct = encrypt::<E>(&ek, 2, &crs, gamma_g2, &m);
 
         let mut ct_bytes = Vec::new();
         ct.serialize_compressed(&mut ct_bytes).unwrap();
@@ -139,7 +151,7 @@ mod tests {
 
         g.serialize_compressed(&mut g1_bytes).unwrap();
         h.serialize_compressed(&mut g2_bytes).unwrap();
-        ak.e_gh.serialize_compressed(&mut e_gh_bytes).unwrap();
+        ek.e_gh.serialize_compressed(&mut e_gh_bytes).unwrap();
 
         println!("G1 len: {} bytes", g1_bytes.len());
         println!("G2 len: {} bytes", g2_bytes.len());

@@ -6,32 +6,29 @@ use ark_poly::{
     univariate::DensePolynomial, DenseUVPolynomial, EvaluationDomain, Polynomial,
     Radix2EvaluationDomain,
 };
+
 use ark_std::{One, Zero};
-use std::ops::Div;
 
 use crate::ste::{
-    encryption::Ciphertext,
-    kzg::{PowersOfTau, KZG10},
-    setup::AggregateKey,
+    aggregate::AggregateKey, crs::CRS, encryption::Ciphertext, setup::PartialDecryption,
     utils::interp_mostly_zero,
 };
 
 pub fn agg_dec<E: Pairing>(
-    partial_decryptions: &[E::G2], //insert 0 if a party did not respond or verification failed
+    partial_decryptions: &Vec<PartialDecryption<E>>, //insert 0 if a party did not respond or verification failed
     ct: &Ciphertext<E>,
     selector: &[bool],
     agg_key: &AggregateKey<E>,
-    params: &PowersOfTau<E>,
+    crs: &CRS<E>,
 ) -> PairingOutput<E> {
-    let n = agg_key.pk.len();
-    let domain = Radix2EvaluationDomain::<E::ScalarField>::new(n).unwrap();
+    let domain = Radix2EvaluationDomain::<E::ScalarField>::new(crs.n).unwrap();
     let domain_elements: Vec<E::ScalarField> = domain.elements().collect();
 
     // points is where B is set to zero
     // parties is the set of parties who have signed
-    let mut points = vec![domain_elements[0]]; // 0 is the dummy party that is always true
+    let mut points = vec![];
     let mut parties: Vec<usize> = Vec::new(); // parties indexed from 0..n-1
-    for i in 0..n {
+    for i in 0..crs.n {
         if selector[i] {
             parties.push(i);
         } else {
@@ -39,49 +36,38 @@ pub fn agg_dec<E: Pairing>(
         }
     }
 
-    let b = interp_mostly_zero(E::ScalarField::one(), &points);
+    let b = interp_mostly_zero(&points);
     let b_evals = domain.fft(&b.coeffs);
 
-    debug_assert!(b.degree() == points.len() - 1);
-    debug_assert!(b.evaluate(&domain_elements[0]) == E::ScalarField::one());
+    debug_assert_eq!(
+        b.degree(),
+        points.len(),
+        "b.degree should be equal to points.len()"
+    );
+    debug_assert!(b.evaluate(&E::ScalarField::zero()) == E::ScalarField::one());
 
     // commit to b in g2
-    let b_g2: E::G2 = KZG10::<E, DensePolynomial<E::ScalarField>>::commit_g2(params, &b)
-        .unwrap()
-        .into();
+    let b_g2: E::G2 = crs.commit_g2(&b.coeffs);
 
-    // q0 = (b-1)/(x-domain_elements[0])
-    let mut bminus1 = b.clone();
-    bminus1.coeffs[0] -= E::ScalarField::one();
+    // q0 = (b-1)/x
+    let q0_g1 = crs.compute_opening_proof(&b.coeffs, &E::ScalarField::zero());
 
-    debug_assert!(bminus1.evaluate(&domain_elements[0]) == E::ScalarField::zero());
-
-    let xminus1 =
-        DensePolynomial::from_coefficients_vec(vec![-domain_elements[0], E::ScalarField::one()]);
-    let q0 = bminus1.div(&xminus1);
-
-    let q0_g1: E::G1 = KZG10::<E, DensePolynomial<E::ScalarField>>::commit_g1(params, &q0)
-        .unwrap()
-        .into();
-
-    // bhat = x^{t+1} * b
-    // insert t+1 0s at the beginning of bhat.coeffs
-    let mut bhat_coeffs = vec![E::ScalarField::zero(); ct.t + 1];
+    // bhat = x^{t} * b
+    // insert t 0s at the beginning of bhat.coeffs
+    let mut bhat_coeffs = vec![E::ScalarField::zero(); ct.t];
     bhat_coeffs.append(&mut b.coeffs.clone());
     let bhat = DensePolynomial::from_coefficients_vec(bhat_coeffs);
-    debug_assert_eq!(bhat.degree(), n);
+    debug_assert_eq!(bhat.degree(), crs.n);
 
-    let bhat_g1: E::G1 = KZG10::<E, DensePolynomial<E::ScalarField>>::commit_g1(params, &bhat)
-        .unwrap()
-        .into();
+    let bhat_g1: E::G1 = crs.commit_g1(&bhat.coeffs);
 
-    let n_inv = E::ScalarField::one() / E::ScalarField::from((n) as u32);
+    let n_inv = E::ScalarField::one() / E::ScalarField::from(crs.n as u32);
 
     // compute the aggregate public key
     let mut bases: Vec<<E as Pairing>::G1Affine> = Vec::new();
     let mut scalars: Vec<<E as Pairing>::ScalarField> = Vec::new();
     for &i in &parties {
-        bases.push(agg_key.pk[i].bls_pk.into());
+        bases.push(agg_key.lag_pks[i].bls_pk.into());
         scalars.push(b_evals[i]);
     }
     let mut apk = E::G1::msm(bases.as_slice(), scalars.as_slice()).unwrap();
@@ -91,7 +77,7 @@ pub fn agg_dec<E: Pairing>(
     let mut bases: Vec<<E as Pairing>::G2Affine> = Vec::new();
     let mut scalars: Vec<<E as Pairing>::ScalarField> = Vec::new();
     for &i in &parties {
-        bases.push(partial_decryptions[i].into());
+        bases.push(partial_decryptions[i].signature.into());
         scalars.push(b_evals[i]);
     }
     let mut sigma = E::G2::msm(bases.as_slice(), scalars.as_slice()).unwrap();
@@ -101,10 +87,18 @@ pub fn agg_dec<E: Pairing>(
     let mut bases: Vec<<E as Pairing>::G1Affine> = Vec::new();
     let mut scalars: Vec<<E as Pairing>::ScalarField> = Vec::new();
     for &i in &parties {
-        bases.push(agg_key.pk[i].sk_li_x.into());
+        bases.push(agg_key.lag_pks[i].sk_li_x.into());
         scalars.push(b_evals[i]);
     }
     let qx = E::G1::msm(bases.as_slice(), scalars.as_slice()).unwrap();
+
+    let mut bases: Vec<<E as Pairing>::G1Affine> = Vec::new();
+    let mut scalars: Vec<<E as Pairing>::ScalarField> = Vec::new();
+    for &i in &parties {
+        bases.push(agg_key.lag_pks[i].sk_li_minus0.into());
+        scalars.push(b_evals[i]);
+    }
+    let qhatx = E::G1::msm(bases.as_slice(), scalars.as_slice()).unwrap();
 
     let mut bases: Vec<<E as Pairing>::G1Affine> = Vec::new();
     let mut scalars: Vec<<E as Pairing>::ScalarField> = Vec::new();
@@ -113,14 +107,6 @@ pub fn agg_dec<E: Pairing>(
         scalars.push(b_evals[i]);
     }
     let qz = E::G1::msm(bases.as_slice(), scalars.as_slice()).unwrap();
-
-    let mut bases: Vec<<E as Pairing>::G1Affine> = Vec::new();
-    let mut scalars: Vec<<E as Pairing>::ScalarField> = Vec::new();
-    for &i in &parties {
-        bases.push(agg_key.pk[i].sk_li_minus0.into());
-        scalars.push(b_evals[i]);
-    }
-    let qhatx = E::G1::msm(bases.as_slice(), scalars.as_slice()).unwrap();
 
     // e(w1||sa1, sa2||w2)
     let minus1 = -E::ScalarField::one();
@@ -142,71 +128,70 @@ pub fn agg_dec<E: Pairing>(
 
     let enc_key = E::multi_pairing(enc_key_lhs, enc_key_rhs);
 
-    assert_eq!(enc_key, ct.enc_key);
-
-    enc_key
+    ct.ct[0] - enc_key
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ste::{
+        crs::CRS,
         encryption::encrypt,
-        kzg::KZG10,
-        setup::{PublicKey, SecretKey},
+        setup::{PartialDecryption, SecretKey},
     };
-    use ark_poly::univariate::DensePolynomial;
-    use ark_std::UniformRand;
 
     type E = ark_bls12_381::Bls12_381;
     type G2 = <E as Pairing>::G2;
-    type Fr = <E as Pairing>::ScalarField;
-    type UniPoly381 = DensePolynomial<<E as Pairing>::ScalarField>;
+    use ark_ec::PrimeGroup;
+    use ark_std::UniformRand;
 
     #[test]
     fn test_decryption() {
         let mut rng = ark_std::test_rng();
-        let n = 1 << 4; // actually n-1 total parties. one party is a dummy party that is always true
-        let t: usize = n / 2;
+        let n = 1 << 3; // actually n-1 total parties. one party is a dummy party that is always true
+        let t: usize = 1;
         debug_assert!(t < n);
 
-        let tau = Fr::rand(&mut rng);
-        let params = KZG10::<E, UniPoly381>::setup(n, tau.clone()).unwrap();
+        let crs = CRS::new(n, &mut rng);
 
-        let mut sk: Vec<SecretKey<E>> = Vec::new();
-        let mut pk: Vec<PublicKey<E>> = Vec::new();
+        let m = vec![PairingOutput::<E>::generator()];
 
-        // create the dummy party's keys
-        sk.push(SecretKey::<E>::new(&mut rng));
-        sk[0].nullify();
-        pk.push(sk[0].get_pk(0, &params, n));
+        let sk = (0..n)
+            .map(|i| SecretKey::<E>::new(&mut rng, i))
+            .collect::<Vec<_>>();
 
-        for i in 1..n {
-            sk.push(SecretKey::<E>::new(&mut rng));
-            pk.push(sk[i].get_pk(i, &params, n))
-        }
+        let pk = sk
+            .iter()
+            .enumerate()
+            .map(|(i, sk)| sk.get_lagrange_pk(i, &crs))
+            .collect::<Vec<_>>();
 
-        let agg_key = AggregateKey::<E>::new(pk, &params);
-        let ct = encrypt::<E>(&agg_key, t, &params);
+        let (ak, ek) = AggregateKey::<E>::new(pk, &crs);
+
+        let gamma_g2 = G2::rand(&mut rng);
+        let ct = encrypt::<E>(&ek, t, &crs, gamma_g2, &m);
 
         // compute partial decryptions
-        let mut partial_decryptions: Vec<G2> = Vec::new();
-        for i in 0..t + 1 {
+        let mut partial_decryptions: Vec<PartialDecryption<E>> = Vec::new();
+        for i in 0..t {
             partial_decryptions.push(sk[i].partial_decryption(&ct));
         }
-        for _ in t + 1..n {
-            partial_decryptions.push(G2::zero());
+        for _ in t..n {
+            partial_decryptions.push(PartialDecryption::<E>::zero());
         }
 
         // compute the decryption key
         let mut selector: Vec<bool> = Vec::new();
-        for _ in 0..t + 1 {
+        for _ in 0..t {
             selector.push(true);
         }
-        for _ in t + 1..n {
+        for _ in t..n {
             selector.push(false);
         }
 
-        let _dec_key = agg_dec(&partial_decryptions, &ct, &selector, &agg_key, &params);
+        assert_eq!(
+            agg_dec(&partial_decryptions, &ct, &selector, &ak, &crs),
+            m[0]
+        );
     }
 }
