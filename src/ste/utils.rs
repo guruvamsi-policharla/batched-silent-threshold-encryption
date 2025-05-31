@@ -134,9 +134,9 @@ mod tests {
     fn open_all_test() {
         let mut rng = ark_std::test_rng();
 
-        let n = 1 << 8;
+        let n = 1 << 4;
         let domain = Radix2EvaluationDomain::<Fr>::new(n).unwrap();
-        let crs = CRS::<E>::new(n, &mut ark_std::test_rng());
+        let crs = CRS::<E>::new(n, 1, &mut ark_std::test_rng());
 
         let mut f: Vec<ark_ff::Fp<ark_ff::MontBackend<ark_bls12_381::FrConfig, 4>, 4>> =
             vec![Fr::zero(); n];
@@ -144,20 +144,20 @@ mod tests {
             f[i] = Fr::rand(&mut rng);
         }
 
-        let com = G1::msm(&crs.powers_of_g[0..f.len()], &f).unwrap();
+        let com = G1::msm(&crs.powers_of_g[0][0..f.len()], &f).unwrap();
 
         let timer = std::time::Instant::now();
-        let pi = open_all_values::<E>(&crs.y, &f, &domain);
+        let pi = open_all_values::<E>(&crs.y[0], &f, &domain);
         println!("open_all_values took {:?}", timer.elapsed());
 
         // verify the kzg proof
-        let g = crs.powers_of_g[0];
-        let h = crs.powers_of_h[0];
+        let g = crs.powers_of_g[0][0];
+        let h = crs.powers_of_h[0][0];
 
         let fpoly = DensePolynomial::from_coefficients_vec(f.clone());
         for i in 0..n {
             let lhs = E::pairing(com - (g * fpoly.evaluate(&domain.element(i))), h);
-            let rhs = E::pairing(pi[i], crs.powers_of_h[1] - (h * domain.element(i)));
+            let rhs = E::pairing(pi[i], crs.powers_of_h[0][1] - (h * domain.element(i)));
             assert_eq!(lhs, rhs);
         }
     }

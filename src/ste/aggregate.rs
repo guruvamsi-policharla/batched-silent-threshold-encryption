@@ -16,7 +16,9 @@ pub struct EncryptionKey<E: Pairing> {
     #[serde(serialize_with = "ark_se", deserialize_with = "ark_de")]
     pub z_g2: E::G2,
     #[serde(serialize_with = "ark_se", deserialize_with = "ark_de")]
-    pub e_gh: PairingOutput<E>,
+    pub e_gh: Vec<PairingOutput<E>>,
+    #[serde(serialize_with = "ark_se", deserialize_with = "ark_de")]
+    pub gamma_g2: Vec<E::G2>,
 }
 
 #[derive(CanonicalSerialize, CanonicalDeserialize, Serialize, Deserialize, Clone)]
@@ -24,27 +26,29 @@ pub struct AggregateKey<E: Pairing> {
     #[serde(serialize_with = "ark_se", deserialize_with = "ark_de")]
     pub lag_pks: Vec<LagPublicKey<E>>,
     #[serde(serialize_with = "ark_se", deserialize_with = "ark_de")]
-    pub agg_sk_li_lj_z: Vec<E::G1>,
+    pub agg_sk_li_lj_z: Vec<Vec<E::G1>>,
 }
 
 impl<E: Pairing> AggregateKey<E> {
     pub fn new(lag_pks: Vec<LagPublicKey<E>>, crs: &CRS<E>) -> (Self, EncryptionKey<E>) {
         let n = lag_pks.len();
-        let z_g2 = crs.powers_of_h[n] + crs.powers_of_h[0] * (-E::ScalarField::one());
+        let z_g2 = crs.powers_of_h[0][n] + crs.powers_of_h[0][0] * (-E::ScalarField::one());
 
         // gather sk_li from all public keys
         let mut ask = E::G1::zero();
         for pki in lag_pks.iter() {
-            ask += pki.sk_li;
+            ask += pki.sk_li[0];
         }
 
-        let mut agg_sk_li_lj_z = vec![];
-        for i in 0..n {
-            let mut agg_sk_li_lj_zi = E::G1::zero();
-            for pkj in lag_pks.iter() {
-                agg_sk_li_lj_zi += pkj.sk_li_lj_z[i];
+        let mut agg_sk_li_lj_z = vec![vec![E::G1::zero(); crs.n]; crs.l];
+        for k in 0..crs.l {
+            for i in 0..n {
+                let mut agg_sk_li_lj_zi = E::G1::zero();
+                for pkj in lag_pks.iter() {
+                    agg_sk_li_lj_zi += pkj.sk_li_lj_z[k][i];
+                }
+                agg_sk_li_lj_z[k][i] = agg_sk_li_lj_zi;
             }
-            agg_sk_li_lj_z.push(agg_sk_li_lj_zi);
         }
 
         (
@@ -55,7 +59,12 @@ impl<E: Pairing> AggregateKey<E> {
             EncryptionKey {
                 ask,
                 z_g2,
-                e_gh: E::pairing(crs.powers_of_g[0], crs.powers_of_h[0]),
+                e_gh: crs
+                    .gen_g
+                    .iter()
+                    .map(|g| E::pairing(g, crs.gen_h[0]))
+                    .collect(),
+                gamma_g2: crs.gamma_g2.clone(),
             },
         )
     }
@@ -112,20 +121,17 @@ impl<E: Pairing> SystemPublicKeys<E> {
             }
         }
 
-        use rayon::prelude::*;
+        // use rayon::prelude::*;
 
         let timer = start_timer!(|| "Setup System Public Keys");
         let mut lag_pks = vec![vec![]; m];
-        lag_pks
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(i, lag_pk_i)| {
-                let mut lag_pk_inner = vec![];
-                for j in 0..k {
-                    lag_pk_inner.push(pks[i].get_lag_public_key(positions[i][j], crs, &lag_polys));
-                }
-                *lag_pk_i = lag_pk_inner;
-            });
+        lag_pks.iter_mut().enumerate().for_each(|(i, lag_pk_i)| {
+            let mut lag_pk_inner = vec![];
+            for j in 0..k {
+                lag_pk_inner.push(pks[i].get_lag_public_key(positions[i][j], crs, &lag_polys));
+            }
+            *lag_pk_i = lag_pk_inner;
+        });
         end_timer!(timer);
 
         Self { m, k, pks, lag_pks }
@@ -214,9 +220,10 @@ mod tests {
 
     #[test]
     fn setup_system_public_keys() {
-        let n = 1 << 7;
-        let m = 1 << 10;
-        let crs = CRS::<E>::new(n, &mut ark_std::test_rng());
+        let n = 1 << 2;
+        let m = 1 << 4;
+        let l = 8;
+        let crs = CRS::<E>::new(n, l, &mut ark_std::test_rng());
         let lag_polys = LagPolys::<F>::new(n);
         use rayon::prelude::*;
 

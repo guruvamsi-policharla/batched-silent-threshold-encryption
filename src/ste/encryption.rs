@@ -1,21 +1,19 @@
 use crate::ste::{aggregate::EncryptionKey, crs::CRS};
+use crate::utils::{ark_de, ark_se};
 use ark_ec::{
     pairing::{Pairing, PairingOutput},
     PrimeGroup,
 };
 use ark_serialize::*;
 use ark_std::UniformRand;
-use std::ops::Mul;
-
-use crate::utils::{ark_de, ark_se};
+use ark_std::Zero;
 use serde::{Deserialize, Serialize};
+use std::ops::Mul;
 
 #[derive(
     Debug, CanonicalSerialize, CanonicalDeserialize, Serialize, Deserialize, Clone, PartialEq,
 )]
 pub struct Ciphertext<E: Pairing> {
-    #[serde(serialize_with = "ark_se", deserialize_with = "ark_de")]
-    pub gamma_g2: E::G2,
     #[serde(serialize_with = "ark_se", deserialize_with = "ark_de")]
     pub sa1: [E::G1; 2],
     #[serde(serialize_with = "ark_se", deserialize_with = "ark_de")]
@@ -29,20 +27,8 @@ pub struct Ciphertext<E: Pairing> {
 }
 
 impl<E: Pairing> Ciphertext<E> {
-    pub fn new(
-        gamma_g2: E::G2,
-        sa1: [E::G1; 2],
-        sa2: [E::G2; 6],
-        ct: Vec<PairingOutput<E>>,
-        t: usize,
-    ) -> Self {
-        Ciphertext {
-            gamma_g2,
-            sa1,
-            sa2,
-            ct,
-            t,
-        }
+    pub fn new(sa1: [E::G1; 2], sa2: [E::G2; 6], ct: Vec<PairingOutput<E>>, t: usize) -> Self {
+        Ciphertext { sa1, sa2, ct, t }
     }
 }
 
@@ -51,13 +37,9 @@ pub fn encrypt<E: Pairing>(
     ek: &EncryptionKey<E>,
     t: usize,
     crs: &CRS<E>,
-    gamma_g2: E::G2, // this should be hash_to_point(attestation_data)
     m: &Vec<PairingOutput<E>>,
 ) -> Ciphertext<E> {
     let mut rng = ark_std::test_rng();
-
-    let g = crs.powers_of_g[0];
-    let h = crs.powers_of_h[0];
 
     let mut sa1 = [E::G1::generator(); 2];
     let mut sa2 = [E::G2::generator(); 6];
@@ -66,41 +48,43 @@ pub fn encrypt<E: Pairing>(
         .map(|_| E::ScalarField::rand(&mut rng))
         .collect::<Vec<_>>();
 
+    // s[0] = E::ScalarField::zero();
+    // s[1] = E::ScalarField::zero();
+    // s[2] = E::ScalarField::zero();
+    // s[3] = E::ScalarField::zero();
+    // s[4] = E::ScalarField::zero();
+
     // sa1[0] = s0*ask + s3*g^{tau^{t}} + s4*g
-    sa1[0] = (ek.ask * s[0]) + (crs.powers_of_g[t] * s[3]) + (crs.powers_of_g[0] * s[4]);
+    sa1[0] = (ek.ask * s[0]) + (crs.powers_of_g[0][t] * s[3]) + (crs.powers_of_g[0][0] * s[4]);
 
     // sa1[1] = s2*g
-    sa1[1] = g * s[2];
+    sa1[1] = crs.powers_of_g[0][0] * s[2];
 
     // sa2[0] = s0*h + s2*gamma_g2
-    sa2[0] = (h * s[0]) + (gamma_g2 * s[2]);
+    sa2[0] = (crs.powers_of_h[0][0] * s[0]) + (ek.gamma_g2[0] * s[2]);
 
     // sa2[1] = s0*z_g2
     sa2[1] = ek.z_g2 * s[0];
 
     // sa2[2] = s0*h^tau + s1*h^{tau^2}
-    sa2[2] = crs.powers_of_h[1] * s[0] + crs.powers_of_h[2] * s[1];
+    sa2[2] = crs.powers_of_h[0][1] * s[0] + crs.powers_of_h[0][2] * s[1];
 
     // sa2[3] = s1*h
-    sa2[3] = h * s[1];
+    sa2[3] = crs.powers_of_h[0][0] * s[1];
 
     // sa2[4] = s3*h
-    sa2[4] = h * s[3];
+    sa2[4] = crs.powers_of_h[0][0] * s[3];
 
     // sa2[5] = s4*h^{tau}
-    sa2[5] = (crs.powers_of_h[1]) * s[4];
+    sa2[5] = (crs.powers_of_h[0][1]) * s[4];
 
-    // ct = s4*e_gh + m[0]
-    // todo: encrypt the entire vector
-    let ct = vec![ek.e_gh.mul(s[4]) + m[0]];
-
-    Ciphertext {
-        gamma_g2,
-        sa1,
-        sa2,
-        ct,
-        t,
+    // ct = s4*e_gh[i] + m[i]
+    let mut ct = vec![PairingOutput::<E>::zero(); crs.l];
+    for i in 0..crs.l {
+        ct[i] = ek.e_gh[i].mul(s[4]) + m[i];
     }
+
+    Ciphertext { sa1, sa2, ct, t }
 }
 
 #[cfg(test)]
@@ -120,7 +104,8 @@ mod tests {
     fn test_encryption() {
         let mut rng = ark_std::test_rng();
         let n = 8;
-        let crs = CRS::new(n, &mut rng);
+        let l = 2;
+        let crs = CRS::new(n, l, &mut rng);
 
         let mut sk: Vec<SecretKey<E>> = Vec::new();
         let mut pk: Vec<LagPublicKey<E>> = Vec::new();
@@ -132,11 +117,9 @@ mod tests {
 
         let (_ak, ek) = AggregateKey::<E>::new(pk, &crs);
 
-        let gamma_g2 = G2::rand(&mut rng);
+        let m = vec![PairingOutput::<E>::generator(); crs.l];
 
-        let m = vec![PairingOutput::<E>::generator()];
-
-        let ct = encrypt::<E>(&ek, 2, &crs, gamma_g2, &m);
+        let ct = encrypt::<E>(&ek, n / 2, &crs, &m);
 
         let mut ct_bytes = Vec::new();
         ct.serialize_compressed(&mut ct_bytes).unwrap();

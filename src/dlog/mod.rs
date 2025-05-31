@@ -77,7 +77,7 @@ impl<G: PrimeGroup> Markers<G> {
         let timer = start_timer!(|| "checking darts");
         for i in 0..(1 << size) {
             if let Some(&j) = self.markers_map.get(&darts[i]) {
-                return Some(G::ScalarField::from(((1 << size) * j - i) as u128));
+                return Some(G::ScalarField::from(((1 << size) * j - i - 1) as u128));
             }
         }
         end_timer!(timer);
@@ -91,6 +91,7 @@ mod tests {
     use super::*;
 
     use ark_ec::pairing::{Pairing, PairingOutput};
+    use rand::Rng;
 
     type E = ark_bls12_381::Bls12_381;
     // type G1 = <E as Pairing>::G1;
@@ -100,8 +101,12 @@ mod tests {
 
     #[test]
     fn test_compute_dlog() {
-        let size = 20;
-        let should_be_dlog = Fr::from((1 << size) + (1 << (size / 3)));
+        let size = 10;
+        // sample a random value between 0 and 2^size
+        let mut rng = rand::rng();
+        let random_value: u128 = rng.random_range(0..(1 << size));
+        let should_be_dlog = Fr::from(random_value);
+
         let target = GT::generator() * should_be_dlog;
 
         let path = &format!("markers_{}.bin", size);
