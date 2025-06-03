@@ -9,8 +9,9 @@ fn main() {
     let mut rng = test_rng();
     let n = 1 << 3;
     let l = 8;
-    let batch_size = 256;
-    let dlog_size = 20;
+    let batch_size = 512;
+    let log_max_input = 41;
+    let log_markers = 24;
     let t: usize = n / 2;
 
     let timer = start_timer!(|| "Sampling CRS");
@@ -69,13 +70,13 @@ fn main() {
     end_timer!(timer);
 
     // read the markers
-    let path = &format!("markers_{}.bin", dlog_size);
+    let path = &format!("markers_{}_{}.bin", log_max_input, log_markers);
     let timer = start_timer!(|| "loading markers");
     let markers = if std::path::Path::new(path).exists() {
         Markers::<PairingOutput<E>>::read_from_file(path)
     } else {
         println!("Markers file not found, generating new markers...");
-        let m = Markers::<PairingOutput<E>>::new(dlog_size);
+        let m = Markers::<PairingOutput<E>>::new(log_max_input, log_markers);
         m.save_to_file(path);
         m
     };

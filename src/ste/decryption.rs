@@ -200,7 +200,8 @@ mod tests {
         let n = 1 << 3;
         let l = 8;
         let t: usize = n / 2;
-        let dlog_size = 20;
+        let log_max_input = 40;
+        let log_markers = 25;
         debug_assert!(t < n);
 
         let crs = CRS::new(n, l, &mut rng);
@@ -245,12 +246,12 @@ mod tests {
         assert_eq!(recovered_m, m);
 
         // read the markers
-        let path = &format!("markers_{}.bin", dlog_size);
+        let path = &format!("markers_{}_{}.bin", log_max_input, log_markers);
         let markers = if std::path::Path::new(path).exists() {
             Markers::<PairingOutput<E>>::read_from_file(path)
         } else {
             println!("Markers file not found, generating new markers...");
-            let m = Markers::<PairingOutput<E>>::new(dlog_size);
+            let m = Markers::<PairingOutput<E>>::new(log_max_input, log_markers);
             m.save_to_file(path);
             m
         };

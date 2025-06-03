@@ -5,9 +5,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Bases and markers to solve a DLog problem with the power in the range of [0, 2^size)
+/// log_max_input must be log_markers + log_bases
+/// The performance here has some interesting quirks that can be further optimized
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Markers<G: PrimeGroup> {
-    pub max_input: usize,
+    pub log_max_input: usize,
+    pub log_markers: usize,
     #[serde(serialize_with = "ark_se", deserialize_with = "ark_de")]
     pub bases: Vec<G>,
     #[serde(serialize_with = "ark_map_se", deserialize_with = "ark_map_de")]
@@ -15,50 +18,43 @@ pub struct Markers<G: PrimeGroup> {
 }
 
 impl<G: PrimeGroup> Markers<G> {
-    pub fn new(max_input: usize) -> Self {
-        let size = max_input;
+    pub fn new(log_max_input: usize, log_markers: usize) -> Self {
+        let log_bases = log_max_input - log_markers;
 
         let timer: ark_std::perf_trace::TimerInfo = start_timer!(|| "computing bases");
-        let mut bases = vec![G::zero(); 1 << size]; // elements from 0 to 2^size
+        let mut bases = vec![G::zero(); 1 << log_bases]; // elements from 0 to 2^size
 
         // NOTE: AVOID CALLING G::generator(). Arkworks actually computes the pairing every time instead of using a hardcoded generation
         bases[0] = G::generator();
-        for i in 1..(1 << size) {
+        for i in 1..(1 << log_bases) {
             bases[i] = bases[i - 1] + bases[0];
         }
         end_timer!(timer);
 
-        let mut markers = vec![G::zero(); 1 << size]; // markers at evenly spaced 2^size points between 0 and 2^{2*size}
-        let diff = G::generator() * G::ScalarField::from(1 << size);
-
+        // let mut markers = vec![G::zero(); 1 << log_markers]; // markers at evenly spaced 2^size points between 0 and 2^{2*size}
         let timer = start_timer!(|| "computing markers");
-        for i in 1..(1 << size) {
-            markers[i] = markers[i - 1] + diff;
-        }
-        end_timer!(timer);
+        let mut marker = G::zero();
+        let diff = G::generator() * G::ScalarField::from(1 << log_bases);
+        let mut markers_map = std::collections::HashMap::new();
 
-        // hash the markers using sha2
-        let mut marker_hashes = Vec::with_capacity(markers.len());
-        let timer = start_timer!(|| "hashing markers");
-        for marker in &markers {
-            // Serialize the marker to bytes using bincode
+        let mut bytes = Vec::new();
+        marker.serialize_uncompressed(&mut bytes).unwrap();
+        let hash: [u8; 6] = Sha256::digest(&bytes)[0..6].try_into().unwrap();
+        markers_map.insert(hash, 0);
+
+        for i in 1..(1 << log_markers) {
+            marker += diff;
+
             let mut bytes = Vec::new();
             marker.serialize_uncompressed(&mut bytes).unwrap();
             let hash: [u8; 6] = Sha256::digest(&bytes)[0..6].try_into().unwrap();
-            marker_hashes.push(hash);
-        }
-        end_timer!(timer);
-
-        // store markers in a hashmap
-        let timer = start_timer!(|| "generating markers map");
-        let mut markers_map = std::collections::HashMap::new();
-        for i in 0..(1 << size) {
-            markers_map.insert(marker_hashes[i], i);
+            markers_map.insert(hash, i);
         }
         end_timer!(timer);
 
         Markers {
-            max_input,
+            log_max_input,
+            log_markers,
             bases,
             markers_map,
         }
@@ -79,20 +75,20 @@ impl<G: PrimeGroup> Markers<G> {
     }
 
     pub fn compute_dlog(&self, target: &G) -> Option<G::ScalarField> {
-        let size = self.max_input;
-        let mut darts = vec![G::zero(); 1 << size]; // throwing darts hoping they will hit one of the markers
-        for i in 0..(1 << size) {
+        let log_bases = self.log_max_input - self.log_markers;
+        let mut darts = vec![G::zero(); 1 << log_bases]; // throwing darts hoping they will hit one of the markers
+        for i in 0..(1 << log_bases) {
             darts[i] = *target + self.bases[i];
         }
 
         // check for intersection between darts and markers_map
-        for i in 0..(1 << size) {
+        for i in 0..(1 << log_bases) {
             let mut bytes = Vec::new();
             darts[i].serialize_uncompressed(&mut bytes).unwrap();
             let hash: [u8; 6] = Sha256::digest(&bytes)[0..6].try_into().unwrap();
 
             if let Some(&j) = self.markers_map.get(&hash) {
-                return Some(G::ScalarField::from(((1 << size) * j - i - 1) as u128));
+                return Some(G::ScalarField::from(((1 << log_bases) * j - i - 1) as u128));
             }
         }
 
@@ -113,13 +109,14 @@ mod tests {
 
     #[test]
     fn test_compute_dlog() {
-        let size = 20;
+        let log_max_input = 40;
+        let log_markers = 25;
         // sample a random value between 0 and 2^size
-        let random_value: u128 = 1 << (size) - 1;
+        let random_value: u128 = 100;
         let should_be_dlog = Fr::from(random_value);
 
         let target = GT::generator() * should_be_dlog;
-        let path = &format!("markers_{}.bin", size);
+        let path = &format!("markers_{}_{}.bin", log_max_input, log_markers);
 
         // Read markers from file if exists, else create new and save
         let timer = start_timer!(|| "loading markers");
@@ -127,7 +124,7 @@ mod tests {
             Markers::<GT>::read_from_file(path)
         } else {
             println!("Markers file not found, generating new markers...");
-            let m = Markers::<GT>::new(size);
+            let m = Markers::<GT>::new(log_max_input, log_markers);
             m.save_to_file(path);
             m
         };
