@@ -101,14 +101,14 @@ pub struct PartialDecryption<E: Pairing> {
     pub id: usize,
     /// Party commitment
     #[serde(serialize_with = "ark_se", deserialize_with = "ark_de")]
-    pub signature: Vec<E::G2>,
+    pub pd: E::G1, // sk * (s_3 * [1]_1)
 }
 
 impl<E: Pairing> PartialDecryption<E> {
     pub fn zero() -> Self {
         PartialDecryption {
             id: 0,
-            signature: vec![],
+            pd: E::G1::zero(),
         }
     }
 }
@@ -241,15 +241,11 @@ impl<E: Pairing> SecretKey<E> {
         }
     }
 
-    pub fn partial_decryption(
-        &self,
-        ct: &Ciphertext<E>,
-        gamma_g2: &Vec<E::G2>,
-    ) -> PartialDecryption<E> {
+    pub fn partial_decryption(&self, ct: &Ciphertext<E>) -> PartialDecryption<E> {
         // todo: fix this
         PartialDecryption {
             id: self.id,
-            signature: gamma_g2.iter().map(|&g| g * self.sk).collect::<Vec<_>>(),
+            pd: ct.sa1[1] * self.sk,
         }
     }
 }

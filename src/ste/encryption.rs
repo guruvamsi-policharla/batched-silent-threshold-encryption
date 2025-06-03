@@ -5,6 +5,7 @@ use ark_ec::{
     PrimeGroup,
 };
 use ark_serialize::*;
+use ark_std::rand::Rng;
 use ark_std::UniformRand;
 use ark_std::Zero;
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,30 @@ impl<E: Pairing> Ciphertext<E> {
     pub fn new(sa1: [E::G1; 2], sa2: [E::G2; 6], ct: Vec<PairingOutput<E>>, t: usize) -> Self {
         Ciphertext { sa1, sa2, ct, t }
     }
+
+    pub fn add(&self, other: &Ciphertext<E>) -> Ciphertext<E> {
+        assert_eq!(self.t, other.t, "Thresholds must match for addition");
+        let sa1 = [self.sa1[0] + other.sa1[0], self.sa1[1] + other.sa1[1]];
+        let sa2 = [
+            self.sa2[0] + other.sa2[0],
+            self.sa2[1] + other.sa2[1],
+            self.sa2[2] + other.sa2[2],
+            self.sa2[3] + other.sa2[3],
+            self.sa2[4] + other.sa2[4],
+            self.sa2[5] + other.sa2[5],
+        ];
+        let ct = self.ct.iter().zip(&other.ct).map(|(a, b)| a + b).collect();
+        Ciphertext::new(sa1, sa2, ct, self.t)
+    }
+
+    pub fn zero(l: usize, t: usize) -> Self {
+        Ciphertext {
+            sa1: [E::G1::zero(); 2],
+            sa2: [E::G2::zero(); 6],
+            ct: vec![PairingOutput::<E>::zero(); l],
+            t,
+        }
+    }
 }
 
 /// t is the threshold for encryption and apk is the aggregated public key
@@ -38,14 +63,13 @@ pub fn encrypt<E: Pairing>(
     t: usize,
     crs: &CRS<E>,
     m: &Vec<PairingOutput<E>>,
+    rng: &mut impl Rng,
 ) -> Ciphertext<E> {
-    let mut rng = ark_std::test_rng();
-
     let mut sa1 = [E::G1::generator(); 2];
     let mut sa2 = [E::G2::generator(); 6];
 
     let s = (0..5)
-        .map(|_| E::ScalarField::rand(&mut rng))
+        .map(|_| E::ScalarField::rand(rng))
         .collect::<Vec<_>>();
 
     // s[0] = E::ScalarField::zero();
@@ -119,7 +143,7 @@ mod tests {
 
         let m = vec![PairingOutput::<E>::generator(); crs.l];
 
-        let ct = encrypt::<E>(&ek, n / 2, &crs, &m);
+        let ct = encrypt::<E>(&ek, n / 2, &crs, &m, &mut rng);
 
         let mut ct_bytes = Vec::new();
         ct.serialize_compressed(&mut ct_bytes).unwrap();

@@ -85,25 +85,23 @@ pub fn agg_dec<E: Pairing>(
     let apk = (0..crs.l)
         .map(|chunk| E::G1::msm(bases[chunk].as_slice(), scalars.as_slice()).unwrap() * n_inv)
         .collect::<Vec<_>>();
-    // apk *= n_inv;
 
-    // compute sigma = (\sum B(omega^i)partial_decryptions[i])/(n) for i in parties
-    let mut bases: Vec<Vec<<E as Pairing>::G2Affine>> = vec![vec![]; crs.l];
+    // computing [sk * s_3 * r[i] * gamma]_T directly from pd instead of via sigma
+    let mut sigma_t = vec![PairingOutput::<E>::zero(); crs.l];
+    let mut bases: Vec<<E as Pairing>::G1Affine> = vec![];
     let mut scalars: Vec<<E as Pairing>::ScalarField> = Vec::new();
-    for chunk in 0..crs.l {
-        for &i in &parties {
-            bases[chunk].push(partial_decryptions[i].signature[chunk].into());
-        }
+    for &i in &parties {
+        bases.push(partial_decryptions[i].pd.into());
     }
-
     for &i in &parties {
         scalars.push(b_evals[i]);
     }
 
-    let mut sigma = (0..crs.l)
-        .map(|chunk| E::G2::msm(bases[chunk].as_slice(), scalars.as_slice()).unwrap() * n_inv)
-        .collect::<Vec<_>>();
-    // sigma *= n_inv;
+    let agg_pd = E::G1::msm(bases.as_slice(), scalars.as_slice()).unwrap() * n_inv;
+
+    for chunk in 0..crs.l {
+        sigma_t[chunk] = E::pairing(agg_pd, crs.gamma_g2[chunk]);
+    }
 
     // compute Qx, Qhatx and Qz
     let mut bases: Vec<Vec<<E as Pairing>::G1Affine>> = vec![vec![]; crs.l];
@@ -163,19 +161,17 @@ pub fn agg_dec<E: Pairing>(
             ]
         })
         .collect::<Vec<_>>();
-    let w2 = (0..crs.l)
-        .map(|chunk| [b_g2[chunk], sigma[chunk]])
-        .collect::<Vec<_>>();
+    let w2 = (0..crs.l).map(|chunk| [b_g2[chunk]]).collect::<Vec<_>>();
 
     let mut enc_key = vec![PairingOutput::<E>::zero(); crs.l];
     for chunk in 0..crs.l {
         let mut enc_key_lhs = w1[chunk].to_vec();
-        enc_key_lhs.append(&mut ct.sa1.to_vec());
+        enc_key_lhs.append(&mut ct.sa1[0..1].to_vec());
 
         let mut enc_key_rhs = ct.sa2.to_vec();
         enc_key_rhs.append(&mut w2[chunk].to_vec());
 
-        enc_key[chunk] = E::multi_pairing(enc_key_lhs, enc_key_rhs);
+        enc_key[chunk] = E::multi_pairing(enc_key_lhs, enc_key_rhs) + sigma_t[chunk];
     }
 
     (0..crs.l)
@@ -186,11 +182,15 @@ pub fn agg_dec<E: Pairing>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ste::{
-        crs::CRS,
-        encryption::encrypt,
-        setup::{PartialDecryption, SecretKey},
+    use crate::{
+        dlog::Markers,
+        ste::{
+            crs::CRS,
+            encryption::encrypt,
+            setup::{PartialDecryption, SecretKey},
+        },
     };
+    use ark_ec::PrimeGroup;
 
     type E = ark_bls12_381::Bls12_381;
 
@@ -198,13 +198,16 @@ mod tests {
     fn test_decryption() {
         let mut rng = ark_std::test_rng();
         let n = 1 << 3;
-        let l = 2;
+        let l = 8;
         let t: usize = n / 2;
+        let dlog_size = 20;
         debug_assert!(t < n);
 
         let crs = CRS::new(n, l, &mut rng);
 
-        let m = vec![PairingOutput::<E>::zero(); crs.l];
+        let gen_t = PairingOutput::<E>::generator();
+
+        let m = vec![gen_t; crs.l];
 
         let sk = (0..n)
             .map(|i| SecretKey::<E>::new(&mut rng, i))
@@ -218,18 +221,18 @@ mod tests {
 
         let (ak, ek) = AggregateKey::<E>::new(pk, &crs);
 
-        let ct = encrypt::<E>(&ek, t, &crs, &m);
+        let ct = encrypt::<E>(&ek, t, &crs, &m, &mut rng);
 
         // compute partial decryptions
         let mut partial_decryptions: Vec<PartialDecryption<E>> = Vec::new();
         for i in 0..t {
-            partial_decryptions.push(sk[i].partial_decryption(&ct, &crs.gamma_g2));
+            partial_decryptions.push(sk[i].partial_decryption(&ct));
         }
         for _ in t..n {
             partial_decryptions.push(PartialDecryption::<E>::zero());
         }
 
-        // compute the decryption key
+        // compute the selector
         let mut selector: Vec<bool> = Vec::new();
         for _ in 0..t {
             selector.push(true);
@@ -238,6 +241,21 @@ mod tests {
             selector.push(false);
         }
 
-        assert_eq!(agg_dec(&partial_decryptions, &ct, &selector, &ak, &crs), m);
+        let recovered_m = agg_dec(&partial_decryptions, &ct, &selector, &ak, &crs);
+        assert_eq!(recovered_m, m);
+
+        // read the markers
+        let path = &format!("markers_{}.bin", dlog_size);
+        let markers = if std::path::Path::new(path).exists() {
+            Markers::<PairingOutput<E>>::read_from_file(path)
+        } else {
+            println!("Markers file not found, generating new markers...");
+            let m = Markers::<PairingOutput<E>>::new(dlog_size);
+            m.save_to_file(path);
+            m
+        };
+        for i in 0..crs.l {
+            println!("{}", markers.compute_dlog(&recovered_m[i]).unwrap());
+        }
     }
 }

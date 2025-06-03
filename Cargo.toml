@@ -1,5 +1,5 @@
 [package]
-name = "silent-threshold-encryption"
+name = "silent-batched-threshold-encryption"
 version = "0.1.0"
 edition = "2021"
 
@@ -17,6 +17,8 @@ rayon = { version = "1.5.1" }
 bincode = { version = "1.3" }
 
 hopcroft-karp = { git = "https://github.com/microgravitas/hopcroft-karp" }
+
+sha2 = { version = "0.10.5" }
 
 [features]
 asm = ["ark-ff/asm"]
