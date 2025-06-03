@@ -11,7 +11,7 @@ pub struct Markers<G: PrimeGroup> {
     #[serde(serialize_with = "ark_se", deserialize_with = "ark_de")]
     pub bases: Vec<G>,
     #[serde(serialize_with = "ark_map_se", deserialize_with = "ark_map_de")]
-    pub markers_map: std::collections::HashMap<[u8; 32], usize>,
+    pub markers_map: std::collections::HashMap<[u8; 6], usize>,
 }
 
 impl<G: PrimeGroup> Markers<G> {
@@ -44,7 +44,7 @@ impl<G: PrimeGroup> Markers<G> {
             // Serialize the marker to bytes using bincode
             let mut bytes = Vec::new();
             marker.serialize_uncompressed(&mut bytes).unwrap();
-            let hash: [u8; 32] = Sha256::digest(&bytes).into();
+            let hash: [u8; 6] = Sha256::digest(&bytes)[0..6].try_into().unwrap();
             marker_hashes.push(hash);
         }
         end_timer!(timer);
@@ -89,7 +89,7 @@ impl<G: PrimeGroup> Markers<G> {
         for i in 0..(1 << size) {
             let mut bytes = Vec::new();
             darts[i].serialize_uncompressed(&mut bytes).unwrap();
-            let hash: [u8; 32] = Sha256::digest(&bytes).into();
+            let hash: [u8; 6] = Sha256::digest(&bytes)[0..6].try_into().unwrap();
 
             if let Some(&j) = self.markers_map.get(&hash) {
                 return Some(G::ScalarField::from(((1 << size) * j - i - 1) as u128));
@@ -113,9 +113,9 @@ mod tests {
 
     #[test]
     fn test_compute_dlog() {
-        let size = 18;
+        let size = 20;
         // sample a random value between 0 and 2^size
-        let random_value: u128 = 100;
+        let random_value: u128 = 1 << (size) - 1;
         let should_be_dlog = Fr::from(random_value);
 
         let target = GT::generator() * should_be_dlog;
@@ -132,8 +132,9 @@ mod tests {
             m
         };
         end_timer!(timer);
-
+        let timer = start_timer!(|| "computing dlog");
         let computed_dlog = markers.compute_dlog(&target).unwrap();
+        end_timer!(timer);
         assert_eq!(
             computed_dlog, should_be_dlog,
             "Computed DLog from markers does not match the expected value"
