@@ -1,3 +1,4 @@
+use crate::bte;
 use crate::ste::crs::CRS;
 use crate::ste::encryption::Ciphertext;
 use crate::ste::utils::{lagrange_poly, open_all_values};
@@ -242,11 +243,19 @@ impl<E: Pairing> SecretKey<E> {
     }
 
     pub fn partial_decryption(&self, ct: &Ciphertext<E>) -> PartialDecryption<E> {
-        // todo: fix this
         PartialDecryption {
             id: self.id,
             pd: ct.sa1[1] * self.sk,
         }
+    }
+
+    pub fn batch_partial_decryption(
+        &self,
+        ct: &Vec<bte::encryption::Ciphertext<E>>,
+    ) -> PartialDecryption<E> {
+        let pd: E::G1 = ct.iter().map(|c| c.encrypted_key.sa1[1]).sum::<E::G1>() * self.sk;
+
+        PartialDecryption { id: self.id, pd }
     }
 }
 

@@ -1,22 +1,29 @@
 use ark_bls12_381::Bls12_381;
-use ark_ec::pairing::PairingOutput;
+use ark_ec::pairing::{Pairing, PairingOutput};
 use ark_std::{end_timer, start_timer, test_rng};
 use silent_batched_threshold_encryption::{bte, dlog::Markers, ste};
 
 type E = Bls12_381;
+type F = <E as Pairing>::ScalarField;
 
 fn main() {
     let mut rng = test_rng();
-    let n = 1 << 3;
+    let n = 1 << 7;
     let l = 8;
-    let batch_size = 512;
+    let batch_size = 23;
     let log_max_input = 41;
-    let log_markers = 24;
+    let log_markers = 25;
     let t: usize = n / 2;
+
+    println!(
+        "Parameters: n = {}, l = {}, batch_size = {}, t = {}",
+        n, l, batch_size, t
+    );
 
     let timer = start_timer!(|| "Sampling CRS");
     let bte_crs = bte::crs::CRS::<E>::new(batch_size, &mut rng);
     let ste_crs = ste::crs::CRS::new(n, l, &mut rng);
+    // let lag_polys = ste::setup::LagPolys::<F>::new(ste_crs.n);
     end_timer!(timer);
 
     let timer = start_timer!(|| "Sampling Keys");
@@ -24,7 +31,7 @@ fn main() {
         .map(|i| ste::setup::SecretKey::<E>::new(&mut rng, i))
         .collect::<Vec<_>>();
 
-    let pk = sk
+    let lag_pk = sk
         .iter()
         .enumerate()
         .map(|(i, sk)| sk.get_lagrange_pk(i, &ste_crs))
@@ -32,7 +39,7 @@ fn main() {
     end_timer!(timer);
 
     let timer = start_timer!(|| "Aggregating Keys");
-    let (_ak, ek) = ste::aggregate::AggregateKey::<E>::new(pk, &ste_crs);
+    let (_ak, ek) = ste::aggregate::AggregateKey::<E>::new(lag_pk, &ste_crs);
     end_timer!(timer);
 
     let timer = start_timer!(|| "Encrypting Messages");
@@ -83,6 +90,7 @@ fn main() {
     end_timer!(timer);
 
     // decrypt the ciphertexts
+    let timer = start_timer!(|| "Decrypting Ciphertexts");
     bte::decryption::decrypt(
         &cts,
         &bte_crs,
@@ -93,4 +101,5 @@ fn main() {
         &_ak,
         markers,
     );
+    end_timer!(timer);
 }

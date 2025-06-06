@@ -48,7 +48,7 @@ pub fn decrypt<E: Pairing>(
 
     let mut recovered_masks = vec![PairingOutput::<E>::zero(); ct.len()];
 
-    let timer = start_timer!(|| "Batch Decrypting");
+    let timer = start_timer!(|| "PPRF Evals");
     for i in 0..ct.len() {
         let mask1 = batch_eval(&pprfs, i, &bte_crs);
         let mask2 = k_agg.eval(i, &bte_crs);
@@ -67,7 +67,6 @@ pub fn decrypt<E: Pairing>(
 pub mod tests {
     use super::*;
     use crate::bte::encryption::encrypt;
-    use crate::dlog;
     use ark_bls12_381::Bls12_381;
     use ark_std::{end_timer, start_timer, test_rng};
 
@@ -79,6 +78,8 @@ pub mod tests {
         let n = 1 << 3;
         let l = 8;
         let batch_size = 8;
+        let log_max_input = 41;
+        let log_markers = 24;
         let t: usize = n / 2;
 
         let timer = start_timer!(|| "Sampling CRS");
@@ -108,19 +109,11 @@ pub mod tests {
             .collect::<Vec<_>>();
         end_timer!(timer);
 
-        // aggregate the ciphertexts
-        let timer = start_timer!(|| "Aggregating Ciphertexts");
-        let agg_ct = cts.iter().fold(
-            ste::encryption::Ciphertext::<E>::zero(batch_size, t),
-            |acc, c| acc.add(&c.encrypted_key),
-        );
-        end_timer!(timer);
-
         // compute partial decryptions
         let timer = start_timer!(|| "Computing Partial Decryptions");
         let mut partial_decryptions: Vec<ste::setup::PartialDecryption<E>> = Vec::new();
         for i in 0..t {
-            partial_decryptions.push(sk[i].partial_decryption(&agg_ct));
+            partial_decryptions.push(sk[i].batch_partial_decryption(&cts));
         }
         for _ in t..n {
             partial_decryptions.push(ste::setup::PartialDecryption::<E>::zero());
@@ -137,8 +130,16 @@ pub mod tests {
         end_timer!(timer);
 
         // read the markers
-        let timer = start_timer!(|| "Reading Markers");
-        let markers = dlog::Markers::<PairingOutput<E>>::read_from_file("markers_20.bin");
+        let path = &format!("markers_{}_{}.bin", log_max_input, log_markers);
+        let timer = start_timer!(|| "loading markers");
+        let markers = if std::path::Path::new(path).exists() {
+            Markers::<PairingOutput<E>>::read_from_file(path)
+        } else {
+            println!("Markers file not found, generating new markers...");
+            let m = Markers::<PairingOutput<E>>::new(log_max_input, log_markers);
+            m.save_to_file(path);
+            m
+        };
         end_timer!(timer);
 
         // decrypt the ciphertexts

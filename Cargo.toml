@@ -26,9 +26,22 @@ asm = ["ark-ff/asm"]
 [profile.dev]
 opt-level = 3
 
-# [[bench]]
-# name = "encryption"
-# harness = false
+[[bench]]
+name = "encryption"
+harness = false
+
+[[bench]]
+name = "beatmev_pd"
+harness = false
+
+[[bench]]
+name = "sbte_pd"
+harness = false
+
+
+[[bench]]
+name = "bte_pd"
+harness = false
 
 # [[bench]]
 # name = "decryption"

@@ -1,4 +1,3 @@
-use crate::utils::{ark_de, ark_map_de, ark_map_se, ark_se};
 use ark_ec::PrimeGroup;
 use ark_std::{end_timer, start_timer};
 use serde::{Deserialize, Serialize};
@@ -11,27 +10,15 @@ use sha2::{Digest, Sha256};
 pub struct Markers<G: PrimeGroup> {
     pub log_max_input: usize,
     pub log_markers: usize,
-    #[serde(serialize_with = "ark_se", deserialize_with = "ark_de")]
-    pub bases: Vec<G>,
-    #[serde(serialize_with = "ark_map_se", deserialize_with = "ark_map_de")]
     pub markers_map: std::collections::HashMap<[u8; 6], usize>,
+    _phantom: std::marker::PhantomData<G>,
 }
 
 impl<G: PrimeGroup> Markers<G> {
     pub fn new(log_max_input: usize, log_markers: usize) -> Self {
         let log_bases = log_max_input - log_markers;
 
-        let timer: ark_std::perf_trace::TimerInfo = start_timer!(|| "computing bases");
-        let mut bases = vec![G::zero(); 1 << log_bases]; // elements from 0 to 2^size
-
-        // NOTE: AVOID CALLING G::generator(). Arkworks actually computes the pairing every time instead of using a hardcoded generation
-        bases[0] = G::generator();
-        for i in 1..(1 << log_bases) {
-            bases[i] = bases[i - 1] + bases[0];
-        }
-        end_timer!(timer);
-
-        // let mut markers = vec![G::zero(); 1 << log_markers]; // markers at evenly spaced 2^size points between 0 and 2^{2*size}
+        // markers at evenly spaced 2^size points between 0 and 2^{2*size}
         let timer = start_timer!(|| "computing markers");
         let mut marker = G::zero();
         let diff = G::generator() * G::ScalarField::from(1 << log_bases);
@@ -55,8 +42,8 @@ impl<G: PrimeGroup> Markers<G> {
         Markers {
             log_max_input,
             log_markers,
-            bases,
             markers_map,
+            _phantom: std::marker::PhantomData,
         }
     }
 
@@ -77,8 +64,10 @@ impl<G: PrimeGroup> Markers<G> {
     pub fn compute_dlog(&self, target: &G) -> Option<G::ScalarField> {
         let log_bases = self.log_max_input - self.log_markers;
         let mut darts = vec![G::zero(); 1 << log_bases]; // throwing darts hoping they will hit one of the markers
-        for i in 0..(1 << log_bases) {
-            darts[i] = *target + self.bases[i];
+        let gen_t = G::generator();
+        darts[0] = *target + gen_t;
+        for i in 1..(1 << log_bases) {
+            darts[i] = darts[i - 1] + gen_t;
         }
 
         // check for intersection between darts and markers_map
@@ -109,7 +98,7 @@ mod tests {
 
     #[test]
     fn test_compute_dlog() {
-        let log_max_input = 40;
+        let log_max_input = 41;
         let log_markers = 25;
         // sample a random value between 0 and 2^size
         let random_value: u128 = 100;
