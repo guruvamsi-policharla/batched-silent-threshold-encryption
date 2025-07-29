@@ -1,10 +1,9 @@
 use ark_bls12_381::Bls12_381;
-use ark_ec::pairing::{Pairing, PairingOutput};
+use ark_ec::pairing::PairingOutput;
 use ark_std::{end_timer, start_timer, test_rng};
 use silent_batched_threshold_encryption::{bte, dlog::Markers, ste};
 
 type E = Bls12_381;
-type F = <E as Pairing>::ScalarField;
 
 fn main() {
     let mut rng = test_rng();

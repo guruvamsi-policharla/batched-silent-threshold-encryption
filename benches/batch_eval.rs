@@ -1,8 +1,5 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use silent_batched_threshold_encryption::bte::{
-    crs::CRS,
-    pprf::{batch_eval, naive_batch_eval, PRF},
-};
+use silent_batched_threshold_encryption::bte::{batch_eval, crs::CRS, naive_batch_eval, PRF};
 
 type E = ark_bls12_381::Bls12_381;
 

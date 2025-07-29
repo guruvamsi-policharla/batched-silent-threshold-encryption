@@ -13,7 +13,6 @@ pub struct Ciphertext<E: Pairing> {
     pub pprf: PPRF<E>,
     // encrypt key under the threshold scheme
     pub encrypted_key: crate::ste::encryption::Ciphertext<E>,
-    // pub encrypted_key: E::ScalarField, // todo: this should be replaced with the STE ciphertext
     pub mask: PairingOutput<E>, // todo: message masked with bytes
 }
 
@@ -28,8 +27,7 @@ pub fn encrypt<E: Pairing>(
 ) -> Ciphertext<E> {
     // sample a PRF key
 
-    let prf = PRF::<E>::new(rng); //todo: replace
-                                  // let prf = PRF::<E>::from_key(E::ScalarField::from(1u32));
+    let prf = PRF::<E>::new(rng);
 
     // puncture the PRF at the given position
     let pprf = prf.puncture(position, &bte_crs);
