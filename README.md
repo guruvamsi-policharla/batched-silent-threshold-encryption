@@ -1,4 +1,4 @@
-# Batched Silent Threshold Encryption
+# Batched Threshold Encryption with Silent Setup
 
 Rust implementation of **Batched Threshold Encryption with Silent Setup**, from [ePrint:2025/1419](https://eprint.iacr.org/2025/1419).
 
