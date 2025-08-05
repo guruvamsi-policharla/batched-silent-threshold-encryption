@@ -1,6 +1,6 @@
 # Batched Silent Threshold Encryption
 
-Rust implementation of **Batched Threshold Encryption with Silent Setup**, from [ePrint:2025/XXX](https://eprint.iacr.org/2025/XXX).
+Rust implementation of **Batched Threshold Encryption with Silent Setup**, from [ePrint:2025/1419](https://eprint.iacr.org/2025/1419).
 
 The library has been confirmed to work with version 1.87.0 of the Rust compiler. An end-to-end example demonstrating the full BSTE workflow is provided in the `examples/` directory.
 
