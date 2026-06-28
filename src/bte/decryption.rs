@@ -156,9 +156,15 @@ pub fn decrypt_cca_fft<E: Pairing>(
                 position: ciphertext.position,
             });
         }
-        if !encryption::verify_cca(ciphertext, bte_crs, ste_crs, kzg_crs, ek) {
-            return Err(CcaDecryptionError::InvalidCiphertext(i));
-        }
+    }
+    if !encryption::verify_cca_batch(ct, bte_crs, ste_crs, kzg_crs, ek) {
+        let invalid = ct
+            .iter()
+            .position(|ciphertext| {
+                !encryption::verify_cca(ciphertext, bte_crs, ste_crs, kzg_crs, ek)
+            })
+            .unwrap_or(0);
+        return Err(CcaDecryptionError::InvalidCiphertext(invalid));
     }
 
     let bases = ct

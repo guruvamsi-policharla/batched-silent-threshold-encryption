@@ -1,9 +1,16 @@
 use ark_bls12_381::Bls12_381;
-use ark_ec::pairing::PairingOutput;
+use ark_ec::{
+    pairing::{Pairing, PairingOutput},
+    PrimeGroup,
+};
 use ark_std::{end_timer, start_timer, test_rng, Zero};
 use silent_batched_threshold_encryption::{
-    bte::{self, batch_eval, encryption::NUM_CHUNKS},
+    bte::{
+        self, batch_eval,
+        encryption::{CHUNK_BITS, NUM_CHUNKS},
+    },
     dlog::{self, Markers},
+    nizk::{kzg, pd, range},
     ste,
 };
 use std::time::Instant;
@@ -38,6 +45,7 @@ fn run_benchmark(batch_size: usize, markers: &Markers<PairingOutput<E>>) -> Timi
     let timer = start_timer!(|| "Sampling CRS");
     let bte_crs = bte::crs::CRS::<E>::new(batch_size, &mut rng);
     let ste_crs = ste::crs::CRS::new(n, l, &mut rng);
+    let kzg_crs = kzg::Crs::<E>::new(range::required_kzg_degree(CHUNK_BITS as usize), &mut rng);
     end_timer!(timer);
 
     let timer = start_timer!(|| "Sampling Keys");
@@ -53,35 +61,73 @@ fn run_benchmark(batch_size: usize, markers: &Markers<PairingOutput<E>>) -> Timi
     end_timer!(timer);
 
     let timer = start_timer!(|| "Aggregating Keys");
-    let (ak, ek) = ste::aggregate::AggregateKey::<E>::new(lag_pk, &ste_crs);
+    let (ak, ek) = ste::aggregate::AggregateKey::<E>::new(lag_pk.clone(), &ste_crs);
     end_timer!(timer);
 
     let timer = start_timer!(|| "Encrypting Messages");
+    let gen_t = PairingOutput::<E>::generator();
+    let messages = (0..batch_size)
+        .map(|i| gen_t * <E as Pairing>::ScalarField::from((i + 1) as u64))
+        .collect::<Vec<_>>();
     let cts = (0..batch_size)
-        .map(|i| bte::encryption::encrypt(i, &bte_crs, &ste_crs, &ek, t, &mut rng))
+        .map(|i| {
+            bte::encryption::encrypt_cca(
+                i,
+                messages[i],
+                &bte_crs,
+                &ste_crs,
+                &kzg_crs,
+                &ek,
+                t,
+                &mut rng,
+            )
+        })
         .collect::<Vec<_>>();
     end_timer!(timer);
 
+    let timer = start_timer!(|| "Verifying CCA Ciphertexts");
+    assert!(
+        bte::encryption::verify_cca_batch(&cts, &bte_crs, &ste_crs, &kzg_crs, &ek),
+        "CCA ciphertext verification failed"
+    );
+    end_timer!(timer);
+
     // --- Partial decryption: time a single party (includes ciphertext aggregation) ---
-    let _ = sk[0].batch_partial_decryption(&cts);
+    let _ = sk[0].batch_partial_decryption_cca(&ste_crs, &lag_pk[0], &cts, &mut rng);
     let t0 = Instant::now();
-    let _ = sk[0].batch_partial_decryption(&cts);
+    let _ = sk[0].batch_partial_decryption_cca(&ste_crs, &lag_pk[0], &cts, &mut rng);
     let partial_dec_single = t0.elapsed();
 
     // Build all partial decryptions for reconstruction
-    let agg_ct = cts
+    let verified_partial_decryptions = (0..t)
+        .map(|i| sk[i].batch_partial_decryption_cca(&ste_crs, &lag_pk[i], &cts, &mut rng))
+        .collect::<Vec<_>>();
+
+    let bases = cts
         .iter()
-        .fold(ste::encryption::Ciphertext::<E>::zero(l, t), |acc, c| {
-            acc.add(&c.encrypted_key)
-        });
-    let mut partial_decryptions: Vec<ste::setup::PartialDecryption<E>> = Vec::new();
-    for i in 0..t {
-        partial_decryptions.push(sk[i].partial_decryption(&agg_ct));
+        .map(|c| c.encrypted_key.sa1[1])
+        .collect::<Vec<_>>();
+    for verified in &verified_partial_decryptions {
+        let id = verified.partial.id;
+        assert!(
+            pd::verify_for_bases(
+                &ste_crs,
+                &lag_pk[id],
+                &bases,
+                verified.partial.pd,
+                &verified.proof,
+            ),
+            "partial decryption proof verification failed for party {id}"
+        );
     }
-    for _ in t..n {
-        partial_decryptions.push(ste::setup::PartialDecryption::<E>::zero());
+
+    let mut partial_decryptions = vec![ste::setup::PartialDecryption::<E>::zero(); n];
+    let mut selector = vec![false; n];
+    for verified in &verified_partial_decryptions {
+        let id = verified.partial.id;
+        partial_decryptions[id] = verified.partial.clone();
+        selector[id] = true;
     }
-    let selector: Vec<bool> = (0..n).map(|i| i < t).collect();
 
     // --- [18]: naive B^2 PPRF eval only (no STE layer) ---
     // Recover k_agg via STE (shared cost, not counted for [18])
@@ -98,8 +144,7 @@ fn run_benchmark(batch_size: usize, markers: &Markers<PairingOutput<E>>) -> Timi
         .collect();
     let mut k_agg_scalar = <E as ark_ec::pairing::Pairing>::ScalarField::zero();
     let mut offset = <E as ark_ec::pairing::Pairing>::ScalarField::from(1u64);
-    let chunk_radix =
-        <E as ark_ec::pairing::Pairing>::ScalarField::from(1u128 << bte::encryption::CHUNK_BITS);
+    let chunk_radix = <E as Pairing>::ScalarField::from(1u128 << CHUNK_BITS);
     for chunk in &k_agg_chunks {
         k_agg_scalar += offset * chunk;
         offset *= chunk_radix;
@@ -116,16 +161,19 @@ fn run_benchmark(batch_size: usize, markers: &Markers<PairingOutput<E>>) -> Timi
 
     // --- Sigma_SB: full reconstruction (STE + DLog + FFT PPRF evals) ---
     let t0 = Instant::now();
-    bte::decryption::decrypt_fft(
+    let recovered = bte::decryption::decrypt_cca_fft(
         &cts,
         &bte_crs,
         &ste_crs,
+        &kzg_crs,
         t,
-        &partial_decryptions,
-        &selector,
+        &verified_partial_decryptions,
         &ak,
+        &ek,
         markers.clone(),
-    );
+    )
+    .expect("CCA decryption failed");
+    assert_eq!(recovered, messages, "CCA decryption recovered wrong messages");
     let reconstruct_sb = t0.elapsed();
 
     let timings = Timings {

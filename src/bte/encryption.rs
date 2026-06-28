@@ -171,6 +171,43 @@ pub fn verify_cca<E: Pairing>(
     cca::verify(&statement, &ct.proof.cca)
 }
 
+pub fn verify_cca_batch<E: Pairing>(
+    cts: &[CcaCiphertext<E>],
+    bte_crs: &bte::crs::CRS<E>,
+    ste_crs: &ste::crs::CRS<E>,
+    kzg_crs: &kzg::Crs<E>,
+    ek: &EncryptionKey<E>,
+) -> bool {
+    let range_statements = cts
+        .iter()
+        .map(|ct| (ct.commitments.as_slice(), &ct.proof.range))
+        .collect::<Vec<_>>();
+    if !range::verify_batch(kzg_crs, &range_statements) {
+        return false;
+    }
+
+    let statements = cts
+        .iter()
+        .map(|ct| CcaStatement {
+            bte_crs,
+            ste_crs,
+            kzg_crs,
+            ek,
+            position: ct.position,
+            pprf: &ct.pprf,
+            beta: &ct.beta,
+            encrypted_key: &ct.encrypted_key,
+            commitments: &ct.commitments,
+            range_proof: &ct.proof.range,
+        })
+        .collect::<Vec<_>>();
+    let proofs = cts
+        .iter()
+        .map(|ct| ct.proof.cca.clone())
+        .collect::<Vec<_>>();
+    cca::verify_batch(&statements, &proofs)
+}
+
 pub fn decompose_scalar_key<E: Pairing>(
     mut key: E::ScalarField,
 ) -> (Vec<E::ScalarField>, Vec<u128>) {
@@ -288,5 +325,56 @@ pub mod tests {
         );
         ciphertext.beta += PairingOutput::<E>::generator();
         assert!(!verify_cca(&ciphertext, &bte_crs, &ste_crs, &kzg_crs, &ek));
+    }
+
+    #[test]
+    fn test_verify_cca_batch_rejects_tampered_ciphertext() {
+        let mut rng = test_rng();
+        let n = 1 << 3;
+        let l = NUM_CHUNKS;
+        let batch_size = 4;
+        let t: usize = n / 2;
+
+        let bte_crs = bte::crs::CRS::<E>::new(batch_size, &mut rng);
+        let ste_crs = ste::crs::CRS::new(n, l, &mut rng);
+        let kzg_crs = crate::nizk::kzg::Crs::<E>::new(
+            crate::nizk::range::required_kzg_degree(CHUNK_BITS as usize),
+            &mut rng,
+        );
+
+        let sk = (0..n)
+            .map(|i| ste::setup::SecretKey::<E>::new(&mut rng, i))
+            .collect::<Vec<_>>();
+        let pk = sk
+            .iter()
+            .enumerate()
+            .map(|(i, sk)| sk.get_lagrange_pk(i, &ste_crs))
+            .collect::<Vec<_>>();
+        let (_ak, ek) = ste::aggregate::AggregateKey::<E>::new(pk, &ste_crs);
+        let message = PairingOutput::<E>::generator();
+
+        let mut ciphertexts = (0..batch_size)
+            .map(|position| {
+                encrypt_cca(
+                    position, message, &bte_crs, &ste_crs, &kzg_crs, &ek, t, &mut rng,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(verify_cca_batch(
+            &ciphertexts,
+            &bte_crs,
+            &ste_crs,
+            &kzg_crs,
+            &ek
+        ));
+
+        ciphertexts[2].proof.cca.chunk_responses[0] += <E as Pairing>::ScalarField::from(1u64);
+        assert!(!verify_cca_batch(
+            &ciphertexts,
+            &bte_crs,
+            &ste_crs,
+            &kzg_crs,
+            &ek
+        ));
     }
 }

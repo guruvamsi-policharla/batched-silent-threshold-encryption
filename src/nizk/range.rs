@@ -1,5 +1,5 @@
 use crate::nizk::{
-    kzg::{self, KzgOpening},
+    kzg::{self, KzgOpening, KzgOpeningStatement, KzgTwoPointOpeningStatement},
     transcript::{
         append_serializable, append_usize, challenge_scalar, challenge_scalar_not_in_subgroup,
     },
@@ -80,6 +80,55 @@ pub fn verify<E: Pairing>(crs: &kzg::Crs<E>, commitments: &[E::G1], proof: &Rang
         .all(|(idx, (&commitment, chunk_proof))| {
             verify_chunk(crs, commitment, chunk_proof, proof.bit_width, idx)
         })
+}
+
+pub fn verify_batch<E: Pairing>(
+    crs: &kzg::Crs<E>,
+    statements: &[(&[E::G1], &RangeProof<E>)],
+) -> bool {
+    let mut two_point_statements = Vec::new();
+    let mut single_point_statements = Vec::new();
+    let mut batch_transcript = Transcript::new(b"sbte-bfgw-range-proof-batch");
+    append_usize(&mut batch_transcript, b"statement_count", statements.len());
+
+    for (statement_idx, (commitments, proof)) in statements.iter().enumerate() {
+        append_usize(&mut batch_transcript, b"statement_idx", statement_idx);
+        append_usize(
+            &mut batch_transcript,
+            b"commitment_count",
+            commitments.len(),
+        );
+        append_usize(&mut batch_transcript, b"bit_width", proof.bit_width);
+        if commitments.len() != proof.chunks.len()
+            || proof.bit_width == 0
+            || proof.bit_width >= 128
+            || crs.max_degree < required_kzg_degree(proof.bit_width)
+        {
+            return false;
+        }
+
+        for (idx, (&commitment, chunk_proof)) in commitments.iter().zip(&proof.chunks).enumerate() {
+            append_serializable(&mut batch_transcript, b"commitment", &commitment);
+            append_range_chunk(&mut batch_transcript, chunk_proof);
+            let Some((two_point, single_point)) =
+                verify_chunk_without_kzg(crs, commitment, chunk_proof, proof.bit_width, idx)
+            else {
+                return false;
+            };
+            two_point_statements.push(two_point);
+            single_point_statements.push(single_point);
+        }
+    }
+
+    let two_point_weights = (0..two_point_statements.len())
+        .map(|_| challenge_scalar::<E::ScalarField>(&mut batch_transcript, b"kzg-two-point-weight"))
+        .collect::<Vec<_>>();
+    let single_point_weights = (0..single_point_statements.len())
+        .map(|_| challenge_scalar::<E::ScalarField>(&mut batch_transcript, b"kzg-single-weight"))
+        .collect::<Vec<_>>();
+
+    crs.verify_two_points_batch(&two_point_statements, &two_point_weights)
+        && crs.verify_batch(&single_point_statements, &single_point_weights)
 }
 
 fn prove_chunk<E: Pairing>(
@@ -188,6 +237,68 @@ fn verify_chunk<E: Pairing>(
     lhs.is_zero()
 }
 
+fn verify_chunk_without_kzg<E: Pairing>(
+    crs: &kzg::Crs<E>,
+    commitment: E::G1,
+    proof: &ChunkRangeProof<E>,
+    bit_width: usize,
+    chunk_index: usize,
+) -> Option<(KzgTwoPointOpeningStatement<E>, KzgOpeningStatement<E>)> {
+    let domain = Radix2EvaluationDomain::<E::ScalarField>::new(bit_width)?;
+    let omega = domain.element(1);
+    let omega_last = domain.element(bit_width - 1);
+
+    let mut transcript = range_transcript::<E>(bit_width, chunk_index, commitment);
+    append_serializable(&mut transcript, b"com_g", &proof.com_g);
+    let alpha = challenge_scalar::<E::ScalarField>(&mut transcript, b"bfgw-alpha");
+    append_serializable(&mut transcript, b"com_q", &proof.com_q);
+    let rho =
+        challenge_scalar_not_in_subgroup::<E::ScalarField>(&mut transcript, b"bfgw-rho", bit_width);
+
+    let z_rho = rho.pow(&[bit_width as u64]) - E::ScalarField::one();
+    let v1 = z_rho / (rho - E::ScalarField::one());
+    let v2 = z_rho / (rho - omega_last);
+
+    let one = E::ScalarField::one();
+    let two = E::ScalarField::from(2u64);
+    let alpha_sq = alpha * alpha;
+    let bit_expr = proof.g_at_rho - two * proof.g_at_rho_omega;
+    let lhs = proof.g_at_rho * v1 - proof.hat_w_at_rho
+        + alpha * proof.g_at_rho * (one - proof.g_at_rho) * v2
+        + alpha_sq * bit_expr * (one - bit_expr) * (rho - omega_last);
+    if !lhs.is_zero() {
+        return None;
+    }
+
+    let opening_g = kzg::KzgTwoPointOpening {
+        value_0: proof.g_at_rho,
+        value_1: proof.g_at_rho_omega,
+        proof: proof.proof_g_at_rho_and_rho_omega,
+    };
+    let opening_hat_w_at_rho = KzgOpening {
+        value: proof.hat_w_at_rho,
+        proof: proof.proof_hat_w_at_rho,
+    };
+
+    if crs.max_degree < 2 {
+        return None;
+    }
+
+    Some((
+        KzgTwoPointOpeningStatement {
+            commitment_terms: vec![(proof.com_g, E::ScalarField::one())],
+            point_0: rho,
+            point_1: rho * omega,
+            opening: opening_g,
+        },
+        KzgOpeningStatement {
+            commitment_terms: vec![(commitment, v1), (proof.com_q, z_rho)],
+            point: rho,
+            opening: opening_hat_w_at_rho,
+        },
+    ))
+}
+
 fn range_transcript<E: Pairing>(
     bit_width: usize,
     chunk_index: usize,
@@ -198,6 +309,20 @@ fn range_transcript<E: Pairing>(
     append_usize(&mut transcript, b"chunk_index", chunk_index);
     append_serializable(&mut transcript, b"commitment", &commitment);
     transcript
+}
+
+fn append_range_chunk<E: Pairing>(transcript: &mut Transcript, chunk: &ChunkRangeProof<E>) {
+    append_serializable(transcript, b"range_com_g", &chunk.com_g);
+    append_serializable(transcript, b"range_com_q", &chunk.com_q);
+    append_serializable(transcript, b"range_g_rho", &chunk.g_at_rho);
+    append_serializable(transcript, b"range_g_rho_omega", &chunk.g_at_rho_omega);
+    append_serializable(transcript, b"range_hat_w_rho", &chunk.hat_w_at_rho);
+    append_serializable(
+        transcript,
+        b"range_pi_g_rho_and_rho_omega",
+        &chunk.proof_g_at_rho_and_rho_omega,
+    );
+    append_serializable(transcript, b"range_pi_hat_w_rho", &chunk.proof_hat_w_at_rho);
 }
 
 fn build_bfgw_g<F: PrimeField>(value: u128, bit_width: usize, rng: &mut impl Rng) -> Vec<F> {

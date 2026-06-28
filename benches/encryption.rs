@@ -1,7 +1,9 @@
+use ark_ec::PrimeGroup;
 use ark_std::{end_timer, start_timer, test_rng};
 use criterion::{criterion_group, criterion_main, Criterion};
 use silent_batched_threshold_encryption::{
     bte::{self, encryption::NUM_CHUNKS},
+    nizk::{kzg, range},
     ste,
 };
 
@@ -17,6 +19,10 @@ fn bench_encrypt(c: &mut Criterion) {
     let timer = start_timer!(|| "Sampling CRS");
     let bte_crs = bte::crs::CRS::<E>::new(batch_size, &mut rng);
     let ste_crs = ste::crs::CRS::new(n, l, &mut rng);
+    let kzg_crs = kzg::Crs::<E>::new(
+        range::required_kzg_degree(bte::encryption::CHUNK_BITS as usize),
+        &mut rng,
+    );
     end_timer!(timer);
 
     let timer = start_timer!(|| "Sampling Keys");
@@ -37,6 +43,13 @@ fn bench_encrypt(c: &mut Criterion) {
 
     c.bench_function("encrypt", |b| {
         b.iter(|| bte::encryption::encrypt(0, &bte_crs, &ste_crs, &ek, t, &mut rng))
+    });
+
+    let message = ark_ec::pairing::PairingOutput::<E>::generator();
+    c.bench_function("encrypt_cca", |b| {
+        b.iter(|| {
+            bte::encryption::encrypt_cca(0, message, &bte_crs, &ste_crs, &kzg_crs, &ek, t, &mut rng)
+        })
     });
 }
 
