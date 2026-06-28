@@ -1,4 +1,5 @@
 use crate::bte;
+use crate::nizk::pd::{self, PartialDecryptionProof};
 use crate::ste::crs::CRS;
 use crate::ste::encryption::Ciphertext;
 use crate::ste::utils::{lagrange_poly, open_all_values};
@@ -103,6 +104,12 @@ pub struct PartialDecryption<E: Pairing> {
     /// Party commitment
     #[serde(serialize_with = "ark_se", deserialize_with = "ark_de")]
     pub pd: E::G1, // sk * (s_3 * [1]_1)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VerifiedPartialDecryption<E: Pairing> {
+    pub partial: PartialDecryption<E>,
+    pub proof: PartialDecryptionProof<E>,
 }
 
 impl<E: Pairing> PartialDecryption<E> {
@@ -256,6 +263,26 @@ impl<E: Pairing> SecretKey<E> {
         let pd: E::G1 = ct.iter().map(|c| c.encrypted_key.sa1[1]).sum::<E::G1>() * self.sk;
 
         PartialDecryption { id: self.id, pd }
+    }
+
+    pub fn batch_partial_decryption_cca<R: RngCore>(
+        &self,
+        crs: &CRS<E>,
+        pk: &LagPublicKey<E>,
+        ct: &[bte::encryption::CcaCiphertext<E>],
+        rng: &mut R,
+    ) -> VerifiedPartialDecryption<E> {
+        let bases = ct
+            .iter()
+            .map(|c| c.encrypted_key.sa1[1])
+            .collect::<Vec<_>>();
+        let pd_elem: E::G1 = bases.iter().copied().sum::<E::G1>() * self.sk;
+        let partial = PartialDecryption {
+            id: self.id,
+            pd: pd_elem,
+        };
+        let proof = pd::prove_for_bases(crs, pk, &bases, pd_elem, self.sk, rng);
+        VerifiedPartialDecryption { partial, proof }
     }
 }
 

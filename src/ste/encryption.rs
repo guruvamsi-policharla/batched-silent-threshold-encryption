@@ -27,6 +27,19 @@ pub struct Ciphertext<E: Pairing> {
     pub t: usize, //threshold
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct EncryptionWitness<E: Pairing> {
+    pub s: [E::ScalarField; 5],
+}
+
+impl<E: Pairing> EncryptionWitness<E> {
+    pub fn sample(rng: &mut impl Rng) -> Self {
+        Self {
+            s: std::array::from_fn(|_| E::ScalarField::rand(rng)),
+        }
+    }
+}
+
 impl<E: Pairing> Ciphertext<E> {
     pub fn new(sa1: [E::G1; 2], sa2: [E::G2; 6], ct: Vec<PairingOutput<E>>, t: usize) -> Self {
         Ciphertext { sa1, sa2, ct, t }
@@ -65,12 +78,21 @@ pub fn encrypt<E: Pairing>(
     m: &Vec<PairingOutput<E>>,
     rng: &mut impl Rng,
 ) -> Ciphertext<E> {
+    let witness = EncryptionWitness::<E>::sample(rng);
+    encrypt_with_witness(ek, t, crs, m, &witness)
+}
+
+pub fn encrypt_with_witness<E: Pairing>(
+    ek: &EncryptionKey<E>,
+    t: usize,
+    crs: &CRS<E>,
+    m: &[PairingOutput<E>],
+    witness: &EncryptionWitness<E>,
+) -> Ciphertext<E> {
+    assert_eq!(m.len(), crs.l, "message vector length must match CRS l");
     let mut sa1 = [E::G1::generator(); 2];
     let mut sa2 = [E::G2::generator(); 6];
-
-    let s = (0..5)
-        .map(|_| E::ScalarField::rand(rng))
-        .collect::<Vec<_>>();
+    let s = &witness.s;
 
     // s[0] = E::ScalarField::zero();
     // s[1] = E::ScalarField::zero();
