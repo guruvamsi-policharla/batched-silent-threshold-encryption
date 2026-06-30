@@ -20,7 +20,7 @@ use crate::{
 };
 use ark_ec::{
     pairing::{Pairing, PairingOutput},
-    AffineRepr, PrimeGroup,
+    AffineRepr, CurveGroup, PrimeGroup, VariableBaseMSM,
 };
 use ark_ff::{Field, PrimeField, Zero};
 use ark_poly::{
@@ -61,6 +61,19 @@ pub struct CcaStatementContext {
     pub validity_params_digest: [u8; 32],
     // Digest used by the range-proof transcripts.
     pub range_params_digest: [u8; 32],
+}
+
+// One range-proof statement in a batch verification call.
+pub struct RangeProofBatchItem<'a, E: Pairing> {
+    pub chunk_commitments: &'a PedersenCommitments<E>,
+    pub proof: &'a RangeProof<E>,
+}
+
+// One full CCA ciphertext-validity statement in a batch verification call.
+pub struct ValidityProofBatchItem<'a, E: Pairing> {
+    pub ciphertext: &'a bte::encryption::Ciphertext<E>,
+    pub chunk_commitments: &'a PedersenCommitments<E>,
+    pub proof: &'a ValidityProof<E>,
 }
 
 // Full CCA validity proof for one BTE ciphertext.
@@ -339,6 +352,39 @@ impl<E: Pairing> RangeProof<E> {
         self.verify_with_context(&context_digest, chunk_commitments, ste_crs)
     }
 
+    // Verifies many range proofs under the same STE CRS, batching all KZG
+    // opening checks into one randomized pairing equation.
+    pub fn verify_batch(
+        statements: &[RangeProofBatchItem<'_, E>],
+        ste_crs: &ste::crs::CRS<E>,
+    ) -> bool {
+        let context_digest = range_params_digest(ste_crs);
+        Self::verify_batch_with_context(&context_digest, statements, ste_crs)
+    }
+
+    // Same as [`RangeProof::verify_batch`], but reuses a cached range-parameter
+    // digest.
+    pub fn verify_batch_with_context(
+        range_params_digest: &[u8; 32],
+        statements: &[RangeProofBatchItem<'_, E>],
+        ste_crs: &ste::crs::CRS<E>,
+    ) -> bool {
+        let mut kzg_statements = Vec::new();
+
+        for statement in statements {
+            if !statement.proof.collect_kzg_opening_statements(
+                range_params_digest,
+                statement.chunk_commitments,
+                ste_crs,
+                &mut kzg_statements,
+            ) {
+                return false;
+            }
+        }
+
+        verify_kzg_openings_batch(ste_crs, &kzg_statements)
+    }
+
     // Verifies a range proof using a cached range-parameter digest.
     //
     // Returns `true` only if all committed chunks are proven to be in
@@ -437,6 +483,98 @@ impl<E: Pairing> RangeProof<E> {
 
         true
     }
+
+    fn collect_kzg_opening_statements(
+        &self,
+        range_params_digest: &[u8; 32],
+        chunk_commitments: &PedersenCommitments<E>,
+        ste_crs: &ste::crs::CRS<E>,
+        kzg_statements: &mut Vec<KzgOpeningStatement<E>>,
+    ) -> bool {
+        if validate_range_statement_shape(chunk_commitments, ste_crs).is_err()
+            || self.g_commitments.len() != chunk_commitments.commitments.len()
+            || self.q_commitments.len() != chunk_commitments.commitments.len()
+            || self.openings.len() != chunk_commitments.commitments.len()
+        {
+            return false;
+        }
+
+        let tau = range_tau_challenge(range_params_digest, chunk_commitments, &self.g_commitments);
+        if tau != self.tau {
+            return false;
+        }
+        let rho = range_rho_challenge(
+            range_params_digest,
+            chunk_commitments,
+            &self.g_commitments,
+            self.tau,
+            &self.q_commitments,
+        );
+        if rho != self.rho || is_in_range_domain::<E>(self.rho) {
+            return false;
+        }
+
+        let omega = range_omega::<E>();
+        let omega_last = omega.pow(&[(CHUNK_BITS - 1) as u64]);
+        let rho_omega = self.rho * omega;
+        let rho_n_minus_one = self.rho.pow(&[CHUNK_BITS as u64]) - E::ScalarField::one();
+        let first_quotient_at_rho = match (self.rho - E::ScalarField::one()).inverse() {
+            Some(inv) => rho_n_minus_one * inv,
+            None => return false,
+        };
+        let second_quotient_at_rho = match (self.rho - omega_last).inverse() {
+            Some(inv) => rho_n_minus_one * inv,
+            None => return false,
+        };
+
+        for i in 0..chunk_commitments.commitments.len() {
+            let opening = &self.openings[i];
+            kzg_statements.push(KzgOpeningStatement {
+                chunk: i,
+                commitment_terms: vec![(self.g_commitments[i], E::ScalarField::one())],
+                point: self.rho,
+                value: opening.g_at_rho,
+                proof: opening.g_opening_at_rho,
+            });
+            kzg_statements.push(KzgOpeningStatement {
+                chunk: i,
+                commitment_terms: vec![(self.g_commitments[i], E::ScalarField::one())],
+                point: rho_omega,
+                value: opening.g_at_rho_omega,
+                proof: opening.g_opening_at_rho_omega,
+            });
+
+            let w_hat_commitment = vec![
+                (chunk_commitments.commitments[i], first_quotient_at_rho),
+                (self.q_commitments[i], rho_n_minus_one),
+            ];
+            kzg_statements.push(KzgOpeningStatement {
+                chunk: i,
+                commitment_terms: w_hat_commitment,
+                point: self.rho,
+                value: opening.w_hat_at_rho,
+                proof: opening.w_hat_opening_at_rho,
+            });
+
+            let w2_at_rho = opening.g_at_rho
+                * (E::ScalarField::one() - opening.g_at_rho)
+                * second_quotient_at_rho;
+            let transition = opening.g_at_rho - E::ScalarField::from(2u64) * opening.g_at_rho_omega;
+            let w3_at_rho = transition
+                * (E::ScalarField::one() - opening.g_at_rho
+                    + E::ScalarField::from(2u64) * opening.g_at_rho_omega)
+                * (self.rho - omega_last);
+            let check = opening.g_at_rho * first_quotient_at_rho
+                + self.tau * w2_at_rho
+                + self.tau.square() * w3_at_rho
+                - opening.w_hat_at_rho;
+            if !check.is_zero() {
+                return false;
+            }
+        }
+
+        true
+    }
 }
 
 fn verify_kzg_opening<E: Pairing>(
@@ -456,6 +594,73 @@ fn verify_kzg_opening<E: Pairing>(
         ste_crs.powers_of_h[0][1].into_group() - ste_crs.powers_of_h[0][0].into_group() * point,
     );
     lhs == rhs
+}
+
+struct KzgOpeningStatement<E: Pairing> {
+    chunk: usize,
+    commitment_terms: Vec<(E::G1, E::ScalarField)>,
+    point: E::ScalarField,
+    value: E::ScalarField,
+    proof: E::G1,
+}
+
+fn verify_kzg_openings_batch<E: Pairing>(
+    ste_crs: &ste::crs::CRS<E>,
+    statements: &[KzgOpeningStatement<E>],
+) -> bool {
+    if statements.is_empty() {
+        return true;
+    }
+    if ste_crs.powers_of_h.is_empty() || ste_crs.powers_of_h[0].len() < 2 {
+        return false;
+    }
+
+    let mut transcript = Transcript::new(b"BSTE-CCA-KZG-OPENING-BATCH-V1");
+    transcript.append_usize(b"statement_count", statements.len());
+    for (idx, statement) in statements.iter().enumerate() {
+        if statement.chunk >= ste_crs.l
+            || statement.chunk >= ste_crs.powers_of_g.len()
+            || ste_crs.powers_of_g[statement.chunk].is_empty()
+        {
+            return false;
+        }
+        transcript.append_usize(b"statement_index", idx);
+        transcript.append_usize(b"chunk", statement.chunk);
+        transcript.append_usize(b"commitment_terms", statement.commitment_terms.len());
+        for (base, scalar) in &statement.commitment_terms {
+            transcript.append_serializable(b"commitment_term_base", base);
+            transcript.append_serializable(b"commitment_term_scalar", scalar);
+        }
+        transcript.append_serializable(b"point", &statement.point);
+        transcript.append_serializable(b"value", &statement.value);
+        transcript.append_serializable(b"proof", &statement.proof);
+    }
+
+    let mut lhs_bases = Vec::new();
+    let mut lhs_scalars = Vec::new();
+    let mut proof_bases = Vec::new();
+    let mut proof_scalars = Vec::new();
+
+    for (idx, statement) in statements.iter().enumerate() {
+        transcript.append_usize(b"weight_index", idx);
+        let weight = transcript.challenge_scalar::<E::ScalarField>(b"kzg-opening-weight");
+
+        for &(base, scalar) in &statement.commitment_terms {
+            lhs_bases.push(base);
+            lhs_scalars.push(scalar * weight);
+        }
+        lhs_bases.push(pedersen_value_base(ste_crs, statement.chunk));
+        lhs_scalars.push(-(statement.value * weight));
+        lhs_bases.push(statement.proof);
+        lhs_scalars.push(statement.point * weight);
+
+        proof_bases.push(statement.proof);
+        proof_scalars.push(weight);
+    }
+
+    let lhs = g1_msm::<E>(&lhs_bases, &lhs_scalars);
+    let proof_sum = g1_msm::<E>(&proof_bases, &proof_scalars);
+    E::pairing(lhs, ste_crs.powers_of_h[0][0]) == E::pairing(proof_sum, ste_crs.powers_of_h[0][1])
 }
 
 impl<E: Pairing> SchnorrProof<E> {
@@ -774,6 +979,61 @@ impl<E: Pairing> ValidityProof<E> {
         )
     }
 
+    // Verifies many full CCA ciphertext-validity proofs under the same public
+    // parameters. Range-proof KZG openings are batched across the whole input,
+    // then the compact Schnorr/linkage component is checked for each statement.
+    pub fn verify_batch(
+        statements: &[ValidityProofBatchItem<'_, E>],
+        bte_crs: &bte::crs::CRS<E>,
+        ste_crs: &ste::crs::CRS<E>,
+        ek: &EncryptionKey<E>,
+    ) -> bool {
+        let context = CcaStatementContext::new(bte_crs, ste_crs, ek);
+        Self::verify_batch_with_context(&context, statements, bte_crs, ste_crs, ek)
+    }
+
+    // Same as [`ValidityProof::verify_batch`], but reuses cached public
+    // parameter digests.
+    pub fn verify_batch_with_context(
+        context: &CcaStatementContext,
+        statements: &[ValidityProofBatchItem<'_, E>],
+        bte_crs: &bte::crs::CRS<E>,
+        ste_crs: &ste::crs::CRS<E>,
+        ek: &EncryptionKey<E>,
+    ) -> bool {
+        let mut range_statements = Vec::with_capacity(statements.len());
+        for statement in statements {
+            if validate_statement_shape(
+                statement.ciphertext,
+                bte_crs,
+                ste_crs,
+                ek,
+                statement.chunk_commitments,
+            )
+            .is_err()
+                || statement.proof.z_chunks.len() != statement.chunk_commitments.commitments.len()
+                || statement.proof.z_commitment_randomness.len()
+                    != statement.chunk_commitments.commitments.len()
+            {
+                return false;
+            }
+            range_statements.push(RangeProofBatchItem {
+                chunk_commitments: statement.chunk_commitments,
+                proof: &statement.proof.range_proof,
+            });
+        }
+
+        if !RangeProof::verify_batch_with_context(
+            &context.range_params_digest,
+            &range_statements,
+            ste_crs,
+        ) {
+            return false;
+        }
+
+        verify_compact_schnorr_batch_with_context(context, statements, bte_crs, ste_crs, ek)
+    }
+
     // Verifies both proof components with precomputed statement context:
     // the range proof for valid chunk limbs and the compact Schnorr proof
     // tying those limbs to this exact ciphertext statement.
@@ -821,6 +1081,39 @@ impl<E: Pairing> ValidityProof<E> {
         );
         challenge == self.challenge
     }
+}
+
+fn verify_compact_schnorr_batch_with_context<E: Pairing>(
+    context: &CcaStatementContext,
+    statements: &[ValidityProofBatchItem<'_, E>],
+    bte_crs: &bte::crs::CRS<E>,
+    ste_crs: &ste::crs::CRS<E>,
+    ek: &EncryptionKey<E>,
+) -> bool {
+    for statement in statements {
+        let commitments = reconstruct_schnorr_commitments(
+            statement.proof.challenge,
+            &statement.proof.z_chunks,
+            &statement.proof.z_ste_randomness,
+            &statement.proof.z_commitment_randomness,
+            statement.ciphertext,
+            bte_crs,
+            ste_crs,
+            ek,
+            statement.chunk_commitments,
+        );
+        let challenge = challenge_scalar(
+            &context.validity_params_digest,
+            statement.ciphertext,
+            statement.chunk_commitments,
+            &commitments,
+        );
+        if challenge != statement.proof.challenge {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn validate_statement_shape<E: Pairing>(
@@ -906,6 +1199,16 @@ fn recompose_chunks<E: Pairing>(chunks: &[E::ScalarField]) -> E::ScalarField {
         offset *= radix;
     }
     key
+}
+
+fn g1_msm<E: Pairing>(bases: &[E::G1], scalars: &[E::ScalarField]) -> E::G1 {
+    debug_assert_eq!(bases.len(), scalars.len());
+    if bases.is_empty() {
+        return E::G1::zero();
+    }
+    let bases = E::G1::normalize_batch(bases);
+    let scalars = scalars.iter().map(|s| s.into_bigint()).collect::<Vec<_>>();
+    E::G1::msm_bigint(&bases, &scalars)
 }
 
 fn pedersen_value_base<E: Pairing>(ste_crs: &ste::crs::CRS<E>, chunk: usize) -> E::G1 {
@@ -1247,6 +1550,13 @@ impl Transcript {
         }
     }
 
+    fn challenge_scalar<F: PrimeField>(&mut self, label: &[u8]) -> F {
+        self.append_label(label);
+        let digest: [u8; 32] = self.hasher.clone().finalize().into();
+        self.hasher.update(digest);
+        F::from_le_bytes_mod_order(&digest)
+    }
+
     fn finalize(self) -> [u8; 32] {
         self.hasher.finalize().into()
     }
@@ -1305,6 +1615,158 @@ mod tests {
         );
 
         assert!(proof.verify(&ciphertext, &bte_crs, &ste_crs, &ek, &commitments));
+    }
+
+    #[test]
+    fn valid_ciphertext_proof_batch_verifies() {
+        let (bte_crs, ste_crs, ek, mut rng) = setup();
+        let context = CcaStatementContext::new(&bte_crs, &ste_crs, &ek);
+        let t = 4;
+        let mut ciphertexts = Vec::new();
+        let mut commitments = Vec::new();
+        let mut proofs = Vec::new();
+
+        for position in 0..4 {
+            let (ciphertext, witness) = bte::encryption::encrypt_with_witness(
+                position, &bte_crs, &ste_crs, &ek, t, &mut rng,
+            );
+            let (chunk_commitments, openings) =
+                PedersenCommitments::commit(&witness.chunks, &ste_crs, &mut rng);
+            let proof = ValidityProof::prove_with_context(
+                &context,
+                &ciphertext,
+                &bte_crs,
+                &ste_crs,
+                &ek,
+                &chunk_commitments,
+                &witness,
+                &openings,
+                &mut rng,
+            );
+            ciphertexts.push(ciphertext);
+            commitments.push(chunk_commitments);
+            proofs.push(proof);
+        }
+
+        let statements = (0..ciphertexts.len())
+            .map(|i| ValidityProofBatchItem {
+                ciphertext: &ciphertexts[i],
+                chunk_commitments: &commitments[i],
+                proof: &proofs[i],
+            })
+            .collect::<Vec<_>>();
+
+        assert!(ValidityProof::verify_batch_with_context(
+            &context,
+            &statements,
+            &bte_crs,
+            &ste_crs,
+            &ek
+        ));
+        assert!(ValidityProof::verify_batch(
+            &statements,
+            &bte_crs,
+            &ste_crs,
+            &ek
+        ));
+    }
+
+    #[test]
+    fn tampered_batch_range_proof_does_not_verify() {
+        let (bte_crs, ste_crs, ek, mut rng) = setup();
+        let context = CcaStatementContext::new(&bte_crs, &ste_crs, &ek);
+        let t = 4;
+        let mut ciphertexts = Vec::new();
+        let mut commitments = Vec::new();
+        let mut proofs = Vec::new();
+
+        for position in 0..2 {
+            let (ciphertext, witness) = bte::encryption::encrypt_with_witness(
+                position, &bte_crs, &ste_crs, &ek, t, &mut rng,
+            );
+            let (chunk_commitments, openings) =
+                PedersenCommitments::commit(&witness.chunks, &ste_crs, &mut rng);
+            let proof = ValidityProof::prove_with_context(
+                &context,
+                &ciphertext,
+                &bte_crs,
+                &ste_crs,
+                &ek,
+                &chunk_commitments,
+                &witness,
+                &openings,
+                &mut rng,
+            );
+            ciphertexts.push(ciphertext);
+            commitments.push(chunk_commitments);
+            proofs.push(proof);
+        }
+        proofs[1].range_proof.openings[0].g_at_rho += <E as Pairing>::ScalarField::from(1u64);
+
+        let statements = (0..ciphertexts.len())
+            .map(|i| ValidityProofBatchItem {
+                ciphertext: &ciphertexts[i],
+                chunk_commitments: &commitments[i],
+                proof: &proofs[i],
+            })
+            .collect::<Vec<_>>();
+
+        assert!(!ValidityProof::verify_batch_with_context(
+            &context,
+            &statements,
+            &bte_crs,
+            &ste_crs,
+            &ek
+        ));
+    }
+
+    #[test]
+    fn tampered_batch_challenge_does_not_verify() {
+        let (bte_crs, ste_crs, ek, mut rng) = setup();
+        let context = CcaStatementContext::new(&bte_crs, &ste_crs, &ek);
+        let t = 4;
+        let mut ciphertexts = Vec::new();
+        let mut commitments = Vec::new();
+        let mut proofs = Vec::new();
+
+        for position in 0..2 {
+            let (ciphertext, witness) = bte::encryption::encrypt_with_witness(
+                position, &bte_crs, &ste_crs, &ek, t, &mut rng,
+            );
+            let (chunk_commitments, openings) =
+                PedersenCommitments::commit(&witness.chunks, &ste_crs, &mut rng);
+            let proof = ValidityProof::prove_with_context(
+                &context,
+                &ciphertext,
+                &bte_crs,
+                &ste_crs,
+                &ek,
+                &chunk_commitments,
+                &witness,
+                &openings,
+                &mut rng,
+            );
+            ciphertexts.push(ciphertext);
+            commitments.push(chunk_commitments);
+            proofs.push(proof);
+        }
+        proofs[0].challenge += <E as Pairing>::ScalarField::from(1u64);
+
+        let statements = (0..ciphertexts.len())
+            .map(|i| ValidityProofBatchItem {
+                ciphertext: &ciphertexts[i],
+                chunk_commitments: &commitments[i],
+                proof: &proofs[i],
+            })
+            .collect::<Vec<_>>();
+
+        assert!(!ValidityProof::verify_batch_with_context(
+            &context,
+            &statements,
+            &bte_crs,
+            &ste_crs,
+            &ek
+        ));
     }
 
     #[test]

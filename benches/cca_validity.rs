@@ -1,11 +1,14 @@
 use ark_std::test_rng;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use silent_batched_threshold_encryption::{
     bte::{
         self,
         encryption::{CHUNK_BITS, NUM_CHUNKS},
     },
-    cca::{CcaStatementContext, PedersenCommitments, RangeProof, SchnorrProof, ValidityProof},
+    cca::{
+        CcaStatementContext, PedersenCommitments, RangeProof, RangeProofBatchItem, SchnorrProof,
+        ValidityProof, ValidityProofBatchItem,
+    },
     ste,
 };
 
@@ -149,6 +152,113 @@ fn bench_cca_validity(c: &mut Criterion) {
             proof.verify_with_context(&context, &ciphertext, &bte_crs, &ste_crs, &ek, &commitments)
         })
     });
+
+    for &verify_batch_size in &[1usize, 2, 4, 8] {
+        let mut ciphertexts = Vec::with_capacity(verify_batch_size);
+        let mut commitment_batches = Vec::with_capacity(verify_batch_size);
+        let mut proofs = Vec::with_capacity(verify_batch_size);
+
+        for position in 0..verify_batch_size {
+            let (ciphertext, witness) = bte::encryption::encrypt_with_witness(
+                position, &bte_crs, &ste_crs, &ek, t, &mut rng,
+            );
+            let (commitments, openings) =
+                PedersenCommitments::commit(&witness.chunks, &ste_crs, &mut rng);
+            let proof = ValidityProof::prove_with_context(
+                &context,
+                &ciphertext,
+                &bte_crs,
+                &ste_crs,
+                &ek,
+                &commitments,
+                &witness,
+                &openings,
+                &mut rng,
+            );
+            ciphertexts.push(ciphertext);
+            commitment_batches.push(commitments);
+            proofs.push(proof);
+        }
+
+        let range_statements = (0..verify_batch_size)
+            .map(|i| RangeProofBatchItem {
+                chunk_commitments: &commitment_batches[i],
+                proof: &proofs[i].range_proof,
+            })
+            .collect::<Vec<_>>();
+        let validity_statements = (0..verify_batch_size)
+            .map(|i| ValidityProofBatchItem {
+                ciphertext: &ciphertexts[i],
+                chunk_commitments: &commitment_batches[i],
+                proof: &proofs[i],
+            })
+            .collect::<Vec<_>>();
+
+        group.bench_with_input(
+            BenchmarkId::new("range_verify_individual_loop", verify_batch_size),
+            &verify_batch_size,
+            |b, _| {
+                b.iter(|| {
+                    black_box((0..verify_batch_size).all(|i| {
+                        proofs[i].range_proof.verify_with_context(
+                            &context.range_params_digest,
+                            &commitment_batches[i],
+                            &ste_crs,
+                        )
+                    }))
+                })
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("range_verify_batched_kzg", verify_batch_size),
+            &verify_batch_size,
+            |b, _| {
+                b.iter(|| {
+                    black_box(RangeProof::verify_batch_with_context(
+                        &context.range_params_digest,
+                        &range_statements,
+                        &ste_crs,
+                    ))
+                })
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("full_cca_verify_individual_loop", verify_batch_size),
+            &verify_batch_size,
+            |b, _| {
+                b.iter(|| {
+                    black_box((0..verify_batch_size).all(|i| {
+                        proofs[i].verify_with_context(
+                            &context,
+                            &ciphertexts[i],
+                            &bte_crs,
+                            &ste_crs,
+                            &ek,
+                            &commitment_batches[i],
+                        )
+                    }))
+                })
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("full_cca_verify_batched", verify_batch_size),
+            &verify_batch_size,
+            |b, _| {
+                b.iter(|| {
+                    black_box(ValidityProof::verify_batch_with_context(
+                        &context,
+                        &validity_statements,
+                        &bte_crs,
+                        &ste_crs,
+                        &ek,
+                    ))
+                })
+            },
+        );
+    }
 
     group.bench_function(
         "pedersen_commitments_plus_full_cca_validity_prove_excluding_encryption",

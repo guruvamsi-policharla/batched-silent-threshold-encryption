@@ -3,6 +3,7 @@ use ark_ec::pairing::PairingOutput;
 use ark_std::{end_timer, start_timer, test_rng};
 use silent_batched_threshold_encryption::{
     bte::{self, encryption::NUM_CHUNKS},
+    cca::{CcaStatementContext, PedersenCommitments, ValidityProof, ValidityProofBatchItem},
     dlog::{self, Markers},
     ste,
 };
@@ -46,6 +47,67 @@ fn run_benchmark(batch_size: usize) {
 
     let timer = start_timer!(|| "Aggregating Keys");
     let (ak, ek) = ste::aggregate::AggregateKey::<E>::new(lag_pk, &ste_crs);
+    end_timer!(timer);
+
+    let cca_batch_size = batch_size;
+    let context = CcaStatementContext::new(&bte_crs, &ste_crs, &ek);
+    let timer = start_timer!(|| format!(
+        "Encrypting and proving {} CCA-valid ciphertexts",
+        cca_batch_size
+    ));
+    let mut cca_cts = Vec::with_capacity(cca_batch_size);
+    let mut cca_commitments = Vec::with_capacity(cca_batch_size);
+    let mut cca_proofs = Vec::with_capacity(cca_batch_size);
+    for position in 0..cca_batch_size {
+        let (ciphertext, witness) =
+            bte::encryption::encrypt_with_witness(position, &bte_crs, &ste_crs, &ek, t, &mut rng);
+        let (commitments, openings) =
+            PedersenCommitments::commit(&witness.chunks, &ste_crs, &mut rng);
+        let proof = ValidityProof::prove_with_context(
+            &context,
+            &ciphertext,
+            &bte_crs,
+            &ste_crs,
+            &ek,
+            &commitments,
+            &witness,
+            &openings,
+            &mut rng,
+        );
+        cca_cts.push(ciphertext);
+        cca_commitments.push(commitments);
+        cca_proofs.push(proof);
+    }
+    end_timer!(timer);
+
+    let timer = start_timer!(|| "Verifying CCA validity proofs [individual]");
+    assert!((0..cca_batch_size).all(|i| {
+        cca_proofs[i].verify_with_context(
+            &context,
+            &cca_cts[i],
+            &bte_crs,
+            &ste_crs,
+            &ek,
+            &cca_commitments[i],
+        )
+    }));
+    end_timer!(timer);
+
+    let validity_statements = (0..cca_batch_size)
+        .map(|i| ValidityProofBatchItem {
+            ciphertext: &cca_cts[i],
+            chunk_commitments: &cca_commitments[i],
+            proof: &cca_proofs[i],
+        })
+        .collect::<Vec<_>>();
+    let timer = start_timer!(|| "Verifying CCA validity proofs [batched]");
+    assert!(ValidityProof::verify_batch_with_context(
+        &context,
+        &validity_statements,
+        &bte_crs,
+        &ste_crs,
+        &ek,
+    ));
     end_timer!(timer);
 
     let timer = start_timer!(|| "Encrypting Messages");
