@@ -5,9 +5,9 @@
 // - Pedersen/KZG commitments to the decomposed PRF key chunks.
 // - A polynomial-commitment range proof showing that every committed chunk is
 //   in `[0, 2^CHUNK_BITS)`.
-// - A compact Fiat-Shamir Schnorr proof linking the same chunks to the
-//   punctured PRF key, the STE ciphertext, the Pedersen commitments, and the
-//   public ciphertext mask.
+// - A Fiat-Shamir Schnorr proof linking the same chunks to the punctured PRF
+//   key, the STE ciphertext, the Pedersen commitments, and the public
+//   ciphertext mask.
 //
 // The convenience `prove`/`verify` methods use public-parameter digests
 // internally, such that the Fiat-Shamir challenge hashes do not need to hash the large CRS every time. For repeated proofs under the same public parameters, prefer
@@ -57,7 +57,7 @@ pub struct PedersenOpenings<E: Pairing> {
 // transcript can bind to them without serializing the full CRS repeatedly.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CcaStatementContext {
-    // Digest used by the compact Schnorr proof transcript.
+    // Digest used by the Schnorr proof transcript.
     pub validity_params_digest: [u8; 32],
     // Digest used by the range-proof transcripts.
     pub range_params_digest: [u8; 32],
@@ -82,14 +82,16 @@ pub struct ValidityProofBatchItem<'a, E: Pairing> {
 //
 // - a [`RangeProof`] that the committed chunks are valid `CHUNK_BITS`-bit
 //   limbs, and
-// - a compact [`SchnorrProof`] showing that the same chunks and randomness
+// - a [`SchnorrProof`] showing that the same chunks and randomness
 //   honestly generate the PPRF key, STE encryption, ciphertext mask, and
 //   Pedersen commitments.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ValidityProof<E: Pairing> {
     // Polynomial-commitment range proof for all committed chunks.
     pub range_proof: RangeProof<E>,
-    // Fiat-Shamir challenge for the compact Schnorr proof.
+    // First-round commitments for the Schnorr proof.
+    pub first_round: SchnorrCommitments<E>,
+    // Fiat-Shamir challenge for the Schnorr proof.
     pub challenge: E::ScalarField,
     // Schnorr responses for the PRF key chunks.
     pub z_chunks: Vec<E::ScalarField>,
@@ -99,14 +101,16 @@ pub struct ValidityProof<E: Pairing> {
     pub z_commitment_randomness: Vec<E::ScalarField>,
 }
 
-// Compact Fiat-Shamir Schnorr proof for ciphertext/chunk consistency only.
+// Fiat-Shamir Schnorr proof for ciphertext/chunk consistency only.
 //
 // This is useful for benchmarking or for protocols that want to separate the
 // range proof from the linear consistency proof. It does **not** prove that
 // chunks are in range; use [`ValidityProof`] for the full validity proof.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SchnorrProof<E: Pairing> {
-    // Fiat-Shamir challenge. Commitments are reconstructed during verification.
+    // First-round commitments for the Schnorr proof.
+    pub first_round: SchnorrCommitments<E>,
+    // Fiat-Shamir challenge.
     pub challenge: E::ScalarField,
     // Responses for PRF key chunks.
     pub z_chunks: Vec<E::ScalarField>,
@@ -172,13 +176,14 @@ pub struct RangeChunkProof<E: Pairing> {
     pub w_hat_opening_at_rho: E::G1,
 }
 
-struct SchnorrCommitments<E: Pairing> {
-    a_pprf_key: E::G1,
-    a_mask: PairingOutput<E>,
-    a_sa1: [E::G1; 2],
-    a_sa2: [E::G2; 6],
-    a_ct: Vec<PairingOutput<E>>,
-    a_chunk_commitments: Vec<E::G1>,
+#[derive(Clone, Debug, PartialEq)]
+pub struct SchnorrCommitments<E: Pairing> {
+    pub a_pprf_key: E::G1,
+    pub a_mask: PairingOutput<E>,
+    pub a_sa1: [E::G1; 2],
+    pub a_sa2: [E::G2; 6],
+    pub a_ct: Vec<PairingOutput<E>>,
+    pub a_chunk_commitments: Vec<E::G1>,
 }
 
 impl<E: Pairing> PedersenCommitments<E> {
@@ -770,6 +775,7 @@ impl<E: Pairing> SchnorrProof<E> {
             .collect();
 
         Self {
+            first_round: commitments,
             challenge,
             z_chunks,
             z_ste_randomness,
@@ -777,11 +783,7 @@ impl<E: Pairing> SchnorrProof<E> {
         }
     }
 
-    // Verifies the compact Schnorr/linkage proof without checking ranges.
-    //
-    // Verification reconstructs the omitted Schnorr commitments from
-    // `(challenge, responses, public statement)` and re-derives the
-    // Fiat-Shamir challenge.
+    // Verifies the Schnorr/linkage proof without checking ranges.
     pub fn verify_with_context(
         &self,
         context: &CcaStatementContext,
@@ -796,28 +798,30 @@ impl<E: Pairing> SchnorrProof<E> {
         }
         if self.z_chunks.len() != chunk_commitments.commitments.len()
             || self.z_commitment_randomness.len() != chunk_commitments.commitments.len()
+            || !first_round_shape_matches(&self.first_round, chunk_commitments.commitments.len())
         {
             return false;
         }
 
-        let commitments = reconstruct_schnorr_commitments(
-            self.challenge,
-            &self.z_chunks,
-            &self.z_ste_randomness,
-            &self.z_commitment_randomness,
-            ciphertext,
-            bte_crs,
-            ste_crs,
-            ek,
-            chunk_commitments,
-        );
         let challenge = challenge_scalar(
             &context.validity_params_digest,
             ciphertext,
             chunk_commitments,
-            &commitments,
+            &self.first_round,
         );
         challenge == self.challenge
+            && verify_schnorr_linear_relations(
+                self.challenge,
+                &self.first_round,
+                &self.z_chunks,
+                &self.z_ste_randomness,
+                &self.z_commitment_randomness,
+                ciphertext,
+                bte_crs,
+                ste_crs,
+                ek,
+                chunk_commitments,
+            )
     }
 }
 
@@ -951,6 +955,7 @@ impl<E: Pairing> ValidityProof<E> {
 
         Self {
             range_proof,
+            first_round: commitments,
             challenge,
             z_chunks,
             z_ste_randomness,
@@ -981,7 +986,7 @@ impl<E: Pairing> ValidityProof<E> {
 
     // Verifies many full CCA ciphertext-validity proofs under the same public
     // parameters. Range-proof KZG openings are batched across the whole input,
-    // then the compact Schnorr/linkage component is checked for each statement.
+    // then the Schnorr/linkage equations are batched with randomized MSMs.
     pub fn verify_batch(
         statements: &[ValidityProofBatchItem<'_, E>],
         bte_crs: &bte::crs::CRS<E>,
@@ -1031,11 +1036,11 @@ impl<E: Pairing> ValidityProof<E> {
             return false;
         }
 
-        verify_compact_schnorr_batch_with_context(context, statements, bte_crs, ste_crs, ek)
+        verify_schnorr_batch_with_context(context, statements, bte_crs, ste_crs, ek)
     }
 
     // Verifies both proof components with precomputed statement context:
-    // the range proof for valid chunk limbs and the compact Schnorr proof
+    // the range proof for valid chunk limbs and the Schnorr proof
     // tying those limbs to this exact ciphertext statement.
     pub fn verify_with_context(
         &self,
@@ -1058,62 +1063,363 @@ impl<E: Pairing> ValidityProof<E> {
         }
         if self.z_chunks.len() != chunk_commitments.commitments.len()
             || self.z_commitment_randomness.len() != chunk_commitments.commitments.len()
+            || !first_round_shape_matches(&self.first_round, chunk_commitments.commitments.len())
         {
             return false;
         }
 
-        let commitments = reconstruct_schnorr_commitments(
-            self.challenge,
-            &self.z_chunks,
-            &self.z_ste_randomness,
-            &self.z_commitment_randomness,
-            ciphertext,
-            bte_crs,
-            ste_crs,
-            ek,
-            chunk_commitments,
-        );
         let challenge = challenge_scalar(
             &context.validity_params_digest,
             ciphertext,
             chunk_commitments,
-            &commitments,
+            &self.first_round,
         );
         challenge == self.challenge
+            && verify_schnorr_linear_relations(
+                self.challenge,
+                &self.first_round,
+                &self.z_chunks,
+                &self.z_ste_randomness,
+                &self.z_commitment_randomness,
+                ciphertext,
+                bte_crs,
+                ste_crs,
+                ek,
+                chunk_commitments,
+            )
     }
 }
 
-fn verify_compact_schnorr_batch_with_context<E: Pairing>(
+fn verify_schnorr_batch_with_context<E: Pairing>(
     context: &CcaStatementContext,
     statements: &[ValidityProofBatchItem<'_, E>],
     bte_crs: &bte::crs::CRS<E>,
     ste_crs: &ste::crs::CRS<E>,
     ek: &EncryptionKey<E>,
 ) -> bool {
+    let mut batch_transcript = Transcript::new(b"BSTE-CCA-SCHNORR-BATCH-V1");
+    batch_transcript.append_usize(b"statement_count", statements.len());
+    let mut challenges = Vec::with_capacity(statements.len());
+
     for statement in statements {
-        let commitments = reconstruct_schnorr_commitments(
-            statement.proof.challenge,
-            &statement.proof.z_chunks,
-            &statement.proof.z_ste_randomness,
-            &statement.proof.z_commitment_randomness,
-            statement.ciphertext,
-            bte_crs,
-            ste_crs,
-            ek,
-            statement.chunk_commitments,
-        );
+        if !first_round_shape_matches(
+            &statement.proof.first_round,
+            statement.chunk_commitments.commitments.len(),
+        ) {
+            return false;
+        }
+
         let challenge = challenge_scalar(
             &context.validity_params_digest,
             statement.ciphertext,
             statement.chunk_commitments,
-            &commitments,
+            &statement.proof.first_round,
         );
         if challenge != statement.proof.challenge {
+            return false;
+        }
+
+        append_schnorr_batch_statement(
+            &mut batch_transcript,
+            &context.validity_params_digest,
+            statement,
+        );
+        challenges.push(challenge);
+    }
+
+    let mut g1_bases = Vec::new();
+    let mut g1_scalars = Vec::new();
+    let mut g2_bases = Vec::new();
+    let mut g2_scalars = Vec::new();
+    let mut gt_bases = Vec::new();
+    let mut gt_scalars = Vec::new();
+
+    for (statement, challenge) in statements.iter().zip(challenges) {
+        accumulate_schnorr_batch_equations(
+            statement,
+            challenge,
+            &mut batch_transcript,
+            bte_crs,
+            ste_crs,
+            ek,
+            &mut g1_bases,
+            &mut g1_scalars,
+            &mut g2_bases,
+            &mut g2_scalars,
+            &mut gt_bases,
+            &mut gt_scalars,
+        );
+    }
+
+    g1_msm::<E>(&g1_bases, &g1_scalars).is_zero()
+        && g2_msm::<E>(&g2_bases, &g2_scalars).is_zero()
+        && gt_msm::<E>(&gt_bases, &gt_scalars).is_zero()
+}
+
+fn verify_schnorr_linear_relations<E: Pairing>(
+    challenge: E::ScalarField,
+    first_round: &SchnorrCommitments<E>,
+    z_chunks: &[E::ScalarField],
+    z_ste_randomness: &[E::ScalarField; 5],
+    z_commitment_randomness: &[E::ScalarField],
+    ciphertext: &bte::encryption::Ciphertext<E>,
+    bte_crs: &bte::crs::CRS<E>,
+    ste_crs: &ste::crs::CRS<E>,
+    ek: &EncryptionKey<E>,
+    chunk_commitments: &PedersenCommitments<E>,
+) -> bool {
+    if z_chunks.len() != chunk_commitments.commitments.len()
+        || z_commitment_randomness.len() != chunk_commitments.commitments.len()
+        || !first_round_shape_matches(first_round, chunk_commitments.commitments.len())
+    {
+        return false;
+    }
+
+    let z_key = recompose_chunks::<E>(z_chunks);
+    let point = ciphertext.pprf.point;
+    if bte_crs.powers_of_g[point] * z_key
+        != first_round.a_pprf_key + ciphertext.pprf.key * challenge
+    {
+        return false;
+    }
+    if bte_crs.gt_powers[point] * z_key != first_round.a_mask + ciphertext.mask * challenge {
+        return false;
+    }
+
+    for i in 0..chunk_commitments.commitments.len() {
+        let lhs = pedersen_value_base(ste_crs, i) * z_chunks[i]
+            + pedersen_blinding_base(ste_crs, i) * z_commitment_randomness[i];
+        if lhs != first_round.a_chunk_commitments[i] + chunk_commitments.commitments[i] * challenge
+        {
+            return false;
+        }
+    }
+
+    let (lhs_sa1, lhs_sa2, lhs_ct) = ste_linear_commitments(
+        ste_crs,
+        ek,
+        ciphertext.encrypted_key.t,
+        z_chunks,
+        z_ste_randomness,
+    );
+    for i in 0..2 {
+        if lhs_sa1[i] != first_round.a_sa1[i] + ciphertext.encrypted_key.sa1[i] * challenge {
+            return false;
+        }
+    }
+    for i in 0..6 {
+        if lhs_sa2[i] != first_round.a_sa2[i] + ciphertext.encrypted_key.sa2[i] * challenge {
+            return false;
+        }
+    }
+    for i in 0..chunk_commitments.commitments.len() {
+        if lhs_ct[i] != first_round.a_ct[i] + ciphertext.encrypted_key.ct[i] * challenge {
             return false;
         }
     }
 
     true
+}
+
+fn append_schnorr_batch_statement<E: Pairing>(
+    transcript: &mut Transcript,
+    validity_params_digest: &[u8; 32],
+    statement: &ValidityProofBatchItem<'_, E>,
+) {
+    append_statement(
+        transcript,
+        validity_params_digest,
+        statement.ciphertext,
+        statement.chunk_commitments,
+    );
+    append_schnorr_commitments(transcript, &statement.proof.first_round);
+    transcript.append_serializable(b"schnorr_challenge", &statement.proof.challenge);
+    transcript.append_serializable_slice(b"schnorr_z_chunks", &statement.proof.z_chunks);
+    transcript.append_serializable(
+        b"schnorr_z_ste_randomness",
+        &statement.proof.z_ste_randomness,
+    );
+    transcript.append_serializable_slice(
+        b"schnorr_z_commitment_randomness",
+        &statement.proof.z_commitment_randomness,
+    );
+}
+
+fn accumulate_schnorr_batch_equations<E: Pairing>(
+    statement: &ValidityProofBatchItem<'_, E>,
+    challenge: E::ScalarField,
+    transcript: &mut Transcript,
+    bte_crs: &bte::crs::CRS<E>,
+    ste_crs: &ste::crs::CRS<E>,
+    ek: &EncryptionKey<E>,
+    g1_bases: &mut Vec<E::G1>,
+    g1_scalars: &mut Vec<E::ScalarField>,
+    g2_bases: &mut Vec<E::G2>,
+    g2_scalars: &mut Vec<E::ScalarField>,
+    gt_bases: &mut Vec<PairingOutput<E>>,
+    gt_scalars: &mut Vec<E::ScalarField>,
+) {
+    let mut weight = || transcript.challenge_scalar::<E::ScalarField>(b"cca-schnorr-weight");
+    let ciphertext = statement.ciphertext;
+    let chunk_commitments = statement.chunk_commitments;
+    let proof = statement.proof;
+    let first_round = &proof.first_round;
+    let z = &proof.z_chunks;
+    let z_blind = &proof.z_commitment_randomness;
+    let s = &proof.z_ste_randomness;
+
+    let w = weight();
+    let z_key = recompose_chunks::<E>(z);
+    push_g1(
+        g1_bases,
+        g1_scalars,
+        bte_crs.powers_of_g[ciphertext.pprf.point],
+        w * z_key,
+    );
+    push_g1(g1_bases, g1_scalars, ciphertext.pprf.key, -(w * challenge));
+    push_g1(g1_bases, g1_scalars, first_round.a_pprf_key, -w);
+
+    let w = weight();
+    push_gt(
+        gt_bases,
+        gt_scalars,
+        bte_crs.gt_powers[ciphertext.pprf.point],
+        w * z_key,
+    );
+    push_gt(gt_bases, gt_scalars, ciphertext.mask, -(w * challenge));
+    push_gt(gt_bases, gt_scalars, first_round.a_mask, -w);
+
+    for i in 0..chunk_commitments.commitments.len() {
+        let w = weight();
+        push_g1(
+            g1_bases,
+            g1_scalars,
+            pedersen_value_base(ste_crs, i),
+            w * z[i],
+        );
+        push_g1(
+            g1_bases,
+            g1_scalars,
+            pedersen_blinding_base(ste_crs, i),
+            w * z_blind[i],
+        );
+        push_g1(
+            g1_bases,
+            g1_scalars,
+            chunk_commitments.commitments[i],
+            -(w * challenge),
+        );
+        push_g1(g1_bases, g1_scalars, first_round.a_chunk_commitments[i], -w);
+    }
+
+    let ste_g0 = ste_crs.powers_of_g[0][0].into_group();
+    let ste_gt = ste_crs.powers_of_g[0][ciphertext.encrypted_key.t].into_group();
+    let ste_h0 = ste_crs.powers_of_h[0][0].into_group();
+    let ste_h1 = ste_crs.powers_of_h[0][1].into_group();
+    let ste_h2 = ste_crs.powers_of_h[0][2].into_group();
+
+    let w = weight();
+    push_g1(g1_bases, g1_scalars, ek.ask, w * s[0]);
+    push_g1(g1_bases, g1_scalars, ste_gt, w * s[3]);
+    push_g1(g1_bases, g1_scalars, ste_g0, w * s[4]);
+    push_g1(
+        g1_bases,
+        g1_scalars,
+        ciphertext.encrypted_key.sa1[0],
+        -(w * challenge),
+    );
+    push_g1(g1_bases, g1_scalars, first_round.a_sa1[0], -w);
+
+    let w = weight();
+    push_g1(g1_bases, g1_scalars, ste_g0, w * s[2]);
+    push_g1(
+        g1_bases,
+        g1_scalars,
+        ciphertext.encrypted_key.sa1[1],
+        -(w * challenge),
+    );
+    push_g1(g1_bases, g1_scalars, first_round.a_sa1[1], -w);
+
+    let w = weight();
+    push_g2(g2_bases, g2_scalars, ste_h0, w * s[0]);
+    push_g2(g2_bases, g2_scalars, ek.gamma_g2[0], w * s[2]);
+    push_g2(
+        g2_bases,
+        g2_scalars,
+        ciphertext.encrypted_key.sa2[0],
+        -(w * challenge),
+    );
+    push_g2(g2_bases, g2_scalars, first_round.a_sa2[0], -w);
+
+    let w = weight();
+    push_g2(g2_bases, g2_scalars, ek.z_g2, w * s[0]);
+    push_g2(
+        g2_bases,
+        g2_scalars,
+        ciphertext.encrypted_key.sa2[1],
+        -(w * challenge),
+    );
+    push_g2(g2_bases, g2_scalars, first_round.a_sa2[1], -w);
+
+    let w = weight();
+    push_g2(g2_bases, g2_scalars, ste_h1, w * s[0]);
+    push_g2(g2_bases, g2_scalars, ste_h2, w * s[1]);
+    push_g2(
+        g2_bases,
+        g2_scalars,
+        ciphertext.encrypted_key.sa2[2],
+        -(w * challenge),
+    );
+    push_g2(g2_bases, g2_scalars, first_round.a_sa2[2], -w);
+
+    for (idx, response) in [(3, s[1]), (4, s[3]), (5, s[4])] {
+        let w = weight();
+        let base = if idx == 5 { ste_h1 } else { ste_h0 };
+        push_g2(g2_bases, g2_scalars, base, w * response);
+        push_g2(
+            g2_bases,
+            g2_scalars,
+            ciphertext.encrypted_key.sa2[idx],
+            -(w * challenge),
+        );
+        push_g2(g2_bases, g2_scalars, first_round.a_sa2[idx], -w);
+    }
+
+    let gen_t = PairingOutput::<E>::generator();
+    for i in 0..chunk_commitments.commitments.len() {
+        let w = weight();
+        push_gt(gt_bases, gt_scalars, ek.e_gh[i], w * s[4]);
+        push_gt(gt_bases, gt_scalars, gen_t, w * z[i]);
+        push_gt(
+            gt_bases,
+            gt_scalars,
+            ciphertext.encrypted_key.ct[i],
+            -(w * challenge),
+        );
+        push_gt(gt_bases, gt_scalars, first_round.a_ct[i], -w);
+    }
+}
+
+fn first_round_shape_matches<E: Pairing>(
+    first_round: &SchnorrCommitments<E>,
+    chunk_count: usize,
+) -> bool {
+    first_round.a_chunk_commitments.len() == chunk_count && first_round.a_ct.len() == chunk_count
+}
+
+fn push_g1<B, S>(bases: &mut Vec<B>, scalars: &mut Vec<S>, base: B, scalar: S) {
+    bases.push(base);
+    scalars.push(scalar);
+}
+
+fn push_g2<B, S>(bases: &mut Vec<B>, scalars: &mut Vec<S>, base: B, scalar: S) {
+    bases.push(base);
+    scalars.push(scalar);
+}
+
+fn push_gt<B, S>(bases: &mut Vec<B>, scalars: &mut Vec<S>, base: B, scalar: S) {
+    bases.push(base);
+    scalars.push(scalar);
 }
 
 fn validate_statement_shape<E: Pairing>(
@@ -1209,6 +1515,25 @@ fn g1_msm<E: Pairing>(bases: &[E::G1], scalars: &[E::ScalarField]) -> E::G1 {
     let bases = E::G1::normalize_batch(bases);
     let scalars = scalars.iter().map(|s| s.into_bigint()).collect::<Vec<_>>();
     E::G1::msm_bigint(&bases, &scalars)
+}
+
+fn g2_msm<E: Pairing>(bases: &[E::G2], scalars: &[E::ScalarField]) -> E::G2 {
+    debug_assert_eq!(bases.len(), scalars.len());
+    if bases.is_empty() {
+        return E::G2::zero();
+    }
+    let bases = E::G2::normalize_batch(bases);
+    let scalars = scalars.iter().map(|s| s.into_bigint()).collect::<Vec<_>>();
+    E::G2::msm_bigint(&bases, &scalars)
+}
+
+fn gt_msm<E: Pairing>(bases: &[PairingOutput<E>], scalars: &[E::ScalarField]) -> PairingOutput<E> {
+    debug_assert_eq!(bases.len(), scalars.len());
+    if bases.is_empty() {
+        return PairingOutput::<E>::zero();
+    }
+    let scalars = scalars.iter().map(|s| s.into_bigint()).collect::<Vec<_>>();
+    PairingOutput::<E>::msm_bigint(bases, &scalars)
 }
 
 fn pedersen_value_base<E: Pairing>(ste_crs: &ste::crs::CRS<E>, chunk: usize) -> E::G1 {
@@ -1376,75 +1701,13 @@ fn range_rho_challenge<E: Pairing>(
     rho
 }
 
-fn reconstruct_schnorr_commitments<E: Pairing>(
-    challenge: E::ScalarField,
-    z_chunks: &[E::ScalarField],
-    z_ste_randomness: &[E::ScalarField; 5],
-    z_commitment_randomness: &[E::ScalarField],
-    ciphertext: &bte::encryption::Ciphertext<E>,
-    bte_crs: &bte::crs::CRS<E>,
-    ste_crs: &ste::crs::CRS<E>,
-    ek: &EncryptionKey<E>,
-    chunk_commitments: &PedersenCommitments<E>,
-) -> SchnorrCommitments<E> {
-    // Compact Schnorr proofs omit the first-round commitments. Verification
-    // reconstructs each commitment as L(response) - challenge * public_value,
-    // then hashes the reconstructed commitments back into the challenge.
-    let z_key = recompose_chunks::<E>(z_chunks);
-    let point = ciphertext.pprf.point;
-
-    let a_pprf_key = bte_crs.powers_of_g[point] * z_key - ciphertext.pprf.key * challenge;
-    let a_mask = bte_crs.gt_powers[point] * z_key - ciphertext.mask * challenge;
-
-    let (lhs_sa1, lhs_sa2, lhs_ct) = ste_linear_commitments(
-        ste_crs,
-        ek,
-        ciphertext.encrypted_key.t,
-        z_chunks,
-        z_ste_randomness,
-    );
-    let a_sa1 = [
-        lhs_sa1[0] - ciphertext.encrypted_key.sa1[0] * challenge,
-        lhs_sa1[1] - ciphertext.encrypted_key.sa1[1] * challenge,
-    ];
-    let a_sa2 = [
-        lhs_sa2[0] - ciphertext.encrypted_key.sa2[0] * challenge,
-        lhs_sa2[1] - ciphertext.encrypted_key.sa2[1] * challenge,
-        lhs_sa2[2] - ciphertext.encrypted_key.sa2[2] * challenge,
-        lhs_sa2[3] - ciphertext.encrypted_key.sa2[3] * challenge,
-        lhs_sa2[4] - ciphertext.encrypted_key.sa2[4] * challenge,
-        lhs_sa2[5] - ciphertext.encrypted_key.sa2[5] * challenge,
-    ];
-    let a_ct = lhs_ct
-        .iter()
-        .zip(ciphertext.encrypted_key.ct.iter())
-        .map(|(lhs, ct)| *lhs - *ct * challenge)
-        .collect::<Vec<_>>();
-    let a_chunk_commitments = (0..chunk_commitments.commitments.len())
-        .map(|i| {
-            pedersen_value_base(ste_crs, i) * z_chunks[i]
-                + pedersen_blinding_base(ste_crs, i) * z_commitment_randomness[i]
-                - chunk_commitments.commitments[i] * challenge
-        })
-        .collect::<Vec<_>>();
-
-    SchnorrCommitments {
-        a_pprf_key,
-        a_mask,
-        a_sa1,
-        a_sa2,
-        a_ct,
-        a_chunk_commitments,
-    }
-}
-
 fn challenge_scalar<E: Pairing>(
     validity_params_digest: &[u8; 32],
     ciphertext: &bte::encryption::Ciphertext<E>,
     chunk_commitments: &PedersenCommitments<E>,
     commitments: &SchnorrCommitments<E>,
 ) -> E::ScalarField {
-    let mut transcript = Transcript::new(b"BSTE-CCA-CIPHERTEXT-VALIDITY-V2-COMPACT");
+    let mut transcript = Transcript::new(b"BSTE-CCA-CIPHERTEXT-VALIDITY-V3");
     append_statement(
         &mut transcript,
         validity_params_digest,
@@ -1458,6 +1721,18 @@ fn challenge_scalar<E: Pairing>(
     transcript.append_serializable_slice(b"a_ct", &commitments.a_ct);
     transcript.append_serializable_slice(b"a_chunk_commitments", &commitments.a_chunk_commitments);
     E::ScalarField::from_le_bytes_mod_order(&transcript.finalize())
+}
+
+fn append_schnorr_commitments<E: Pairing>(
+    transcript: &mut Transcript,
+    commitments: &SchnorrCommitments<E>,
+) {
+    transcript.append_serializable(b"a_pprf_key", &commitments.a_pprf_key);
+    transcript.append_serializable(b"a_mask", &commitments.a_mask);
+    transcript.append_serializable(b"a_sa1", &commitments.a_sa1);
+    transcript.append_serializable(b"a_sa2", &commitments.a_sa2);
+    transcript.append_serializable_slice(b"a_ct", &commitments.a_ct);
+    transcript.append_serializable_slice(b"a_chunk_commitments", &commitments.a_chunk_commitments);
 }
 
 fn append_statement<E: Pairing>(
