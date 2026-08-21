@@ -3,13 +3,14 @@ use crate::ste::crs::CRS;
 use crate::ste::encryption::Ciphertext;
 use crate::ste::utils::{lagrange_poly, open_all_values};
 use ark_ec::{pairing::Pairing, AffineRepr, VariableBaseMSM};
-use ark_ff::FftField;
+use ark_ff::{FftField, PrimeField};
 use ark_poly::{
     univariate::DensePolynomial, DenseUVPolynomial, EvaluationDomain, Polynomial,
     Radix2EvaluationDomain,
 };
 use ark_serialize::*;
 use ark_std::{rand::RngCore, UniformRand, Zero};
+use sha2::{Digest, Sha256};
 
 use crate::utils::{ark_de, ark_se};
 use serde::{Deserialize, Serialize};
@@ -105,12 +106,198 @@ pub struct PartialDecryption<E: Pairing> {
     pub pd: E::G1, // sk * (s_3 * [1]_1)
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PartialDecryptionProof<E: Pairing> {
+    // Fiat-Shamir challenge. The first-round commitments are reconstructed by
+    // the verifier from `z_sk`, the public statement, and this challenge.
+    #[serde(serialize_with = "ark_se", deserialize_with = "ark_de")]
+    pub challenge: E::ScalarField,
+    // Schnorr response z = r + challenge * sk.
+    #[serde(serialize_with = "ark_se", deserialize_with = "ark_de")]
+    pub z_sk: E::ScalarField,
+}
+
 impl<E: Pairing> PartialDecryption<E> {
     pub fn zero() -> Self {
         PartialDecryption {
             id: 0,
             pd: E::G1::zero(),
         }
+    }
+}
+
+struct PartialDecryptionCommitments<E: Pairing> {
+    a_pk: E::G1,
+    a_pd: E::G1,
+}
+
+impl<E: Pairing> PartialDecryptionProof<E> {
+    pub fn verify(
+        &self,
+        partial_decryption: &PartialDecryption<E>,
+        ct: &Ciphertext<E>,
+        public_key: &LagPublicKey<E>,
+        crs: &CRS<E>,
+    ) -> bool {
+        let ciphertext_digest = partial_decryption_ciphertext_digest(ct);
+        self.verify_for_base(
+            partial_decryption,
+            ct.sa1[1],
+            &ciphertext_digest,
+            public_key,
+            crs,
+        )
+    }
+
+    pub fn verify_batch(
+        &self,
+        partial_decryption: &PartialDecryption<E>,
+        cts: &[bte::encryption::Ciphertext<E>],
+        public_key: &LagPublicKey<E>,
+        crs: &CRS<E>,
+    ) -> bool {
+        if cts.is_empty() {
+            return false;
+        }
+        let ciphertext_digest = batch_partial_decryption_ciphertext_digest(cts);
+        self.verify_for_base(
+            partial_decryption,
+            batch_partial_decryption_base(cts),
+            &ciphertext_digest,
+            public_key,
+            crs,
+        )
+    }
+
+    fn verify_for_base(
+        &self,
+        partial_decryption: &PartialDecryption<E>,
+        decryption_base: E::G1,
+        ciphertext_digest: &[u8; 32],
+        public_key: &LagPublicKey<E>,
+        crs: &CRS<E>,
+    ) -> bool {
+        if !valid_partial_decryption_statement(partial_decryption, public_key, crs) {
+            return false;
+        }
+
+        // Compact Schnorr reconstruction:
+        //   A_pk = gen_g[0] * z - pk * c
+        //   A_pd = decryption_base * z - pd * c
+        // If z = r + c*sk and the statement is honest, these are exactly the
+        // prover's first-round commitments gen_g[0]*r and decryption_base*r.
+        let commitments = PartialDecryptionCommitments {
+            a_pk: crs.gen_g[0] * self.z_sk - public_key.bls_pk[0] * self.challenge,
+            a_pd: decryption_base * self.z_sk - partial_decryption.pd * self.challenge,
+        };
+        let challenge = partial_decryption_challenge(
+            partial_decryption,
+            decryption_base,
+            ciphertext_digest,
+            public_key,
+            crs,
+            &commitments,
+        );
+        challenge == self.challenge
+    }
+}
+
+fn valid_partial_decryption_statement<E: Pairing>(
+    partial_decryption: &PartialDecryption<E>,
+    public_key: &LagPublicKey<E>,
+    crs: &CRS<E>,
+) -> bool {
+    partial_decryption.id == public_key.id
+        && public_key.position < crs.n
+        && !crs.gen_g.is_empty()
+        && !public_key.bls_pk.is_empty()
+}
+
+fn batch_partial_decryption_base<E: Pairing>(cts: &[bte::encryption::Ciphertext<E>]) -> E::G1 {
+    cts.iter().map(|c| c.encrypted_key.sa1[1]).sum::<E::G1>()
+}
+
+fn partial_decryption_ciphertext_digest<E: Pairing>(ct: &Ciphertext<E>) -> [u8; 32] {
+    let mut transcript = PartialDecryptionTranscript::new(b"STE-PARTIAL-DECRYPTION-CT-V1");
+    transcript.append_serializable(b"ciphertext", ct);
+    transcript.finalize()
+}
+
+fn batch_partial_decryption_ciphertext_digest<E: Pairing>(
+    cts: &[bte::encryption::Ciphertext<E>],
+) -> [u8; 32] {
+    let mut transcript = PartialDecryptionTranscript::new(b"STE-BATCH-PARTIAL-DECRYPTION-CT-V1");
+    transcript.append_usize(b"num_ciphertexts", cts.len());
+    for ct in cts {
+        transcript.append_serializable(b"encrypted_key", &ct.encrypted_key);
+    }
+    transcript.finalize()
+}
+
+fn partial_decryption_challenge<E: Pairing>(
+    partial_decryption: &PartialDecryption<E>,
+    decryption_base: E::G1,
+    ciphertext_digest: &[u8; 32],
+    public_key: &LagPublicKey<E>,
+    crs: &CRS<E>,
+    commitments: &PartialDecryptionCommitments<E>,
+) -> E::ScalarField {
+    let mut transcript = PartialDecryptionTranscript::new(b"STE-PARTIAL-DECRYPTION-SCHNORR-V1");
+    transcript.append_usize(b"crs_n", crs.n);
+    transcript.append_usize(b"crs_l", crs.l);
+    transcript.append_serializable(b"public_generator", &crs.gen_g[0]);
+    transcript.append_usize(b"party_id", public_key.id);
+    transcript.append_usize(b"party_position", public_key.position);
+    transcript.append_serializable(b"public_key", &public_key.bls_pk[0]);
+    transcript.append_usize(b"partial_decryption_id", partial_decryption.id);
+    transcript.append_serializable(b"decryption_base", &decryption_base);
+    transcript.append_serializable(b"partial_decryption", &partial_decryption.pd);
+    transcript.append_bytes(b"ciphertext_digest", ciphertext_digest);
+    transcript.append_serializable(b"a_pk", &commitments.a_pk);
+    transcript.append_serializable(b"a_pd", &commitments.a_pd);
+    E::ScalarField::from_le_bytes_mod_order(&transcript.finalize())
+}
+
+struct PartialDecryptionTranscript {
+    hasher: Sha256,
+}
+
+impl PartialDecryptionTranscript {
+    fn new(domain: &[u8]) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update((domain.len() as u64).to_le_bytes());
+        hasher.update(domain);
+        Self { hasher }
+    }
+
+    fn append_label(&mut self, label: &[u8]) {
+        self.hasher.update((label.len() as u64).to_le_bytes());
+        self.hasher.update(label);
+    }
+
+    fn append_usize(&mut self, label: &[u8], value: usize) {
+        self.append_label(label);
+        self.hasher.update((value as u64).to_le_bytes());
+    }
+
+    fn append_bytes(&mut self, label: &[u8], bytes: &[u8]) {
+        self.append_label(label);
+        self.hasher.update((bytes.len() as u64).to_le_bytes());
+        self.hasher.update(bytes);
+    }
+
+    fn append_serializable<T: CanonicalSerialize>(&mut self, label: &[u8], value: &T) {
+        self.append_label(label);
+        let mut bytes = Vec::new();
+        value
+            .serialize_compressed(&mut bytes)
+            .expect("canonical serialization should succeed");
+        self.hasher.update((bytes.len() as u64).to_le_bytes());
+        self.hasher.update(bytes);
+    }
+
+    fn finalize(self) -> [u8; 32] {
+        self.hasher.finalize().into()
     }
 }
 
@@ -249,6 +436,26 @@ impl<E: Pairing> SecretKey<E> {
         }
     }
 
+    pub fn partial_decryption_with_proof(
+        &self,
+        ct: &Ciphertext<E>,
+        public_key: &LagPublicKey<E>,
+        crs: &CRS<E>,
+        rng: &mut impl RngCore,
+    ) -> (PartialDecryption<E>, PartialDecryptionProof<E>) {
+        let partial_decryption = self.partial_decryption(ct);
+        let ciphertext_digest = partial_decryption_ciphertext_digest(ct);
+        let proof = self.partial_decryption_proof_for_base(
+            &partial_decryption,
+            ct.sa1[1],
+            &ciphertext_digest,
+            public_key,
+            crs,
+            rng,
+        );
+        (partial_decryption, proof)
+    }
+
     pub fn batch_partial_decryption(
         &self,
         ct: &Vec<bte::encryption::Ciphertext<E>>,
@@ -256,6 +463,70 @@ impl<E: Pairing> SecretKey<E> {
         let pd: E::G1 = ct.iter().map(|c| c.encrypted_key.sa1[1]).sum::<E::G1>() * self.sk;
 
         PartialDecryption { id: self.id, pd }
+    }
+
+    pub fn batch_partial_decryption_with_proof(
+        &self,
+        ct: &[bte::encryption::Ciphertext<E>],
+        public_key: &LagPublicKey<E>,
+        crs: &CRS<E>,
+        rng: &mut impl RngCore,
+    ) -> (PartialDecryption<E>, PartialDecryptionProof<E>) {
+        assert!(
+            !ct.is_empty(),
+            "cannot prove an empty batch partial decryption"
+        );
+
+        let partial_decryption = PartialDecryption {
+            id: self.id,
+            pd: batch_partial_decryption_base(ct) * self.sk,
+        };
+        let ciphertext_digest = batch_partial_decryption_ciphertext_digest(ct);
+        let proof = self.partial_decryption_proof_for_base(
+            &partial_decryption,
+            batch_partial_decryption_base(ct),
+            &ciphertext_digest,
+            public_key,
+            crs,
+            rng,
+        );
+        (partial_decryption, proof)
+    }
+
+    fn partial_decryption_proof_for_base(
+        &self,
+        partial_decryption: &PartialDecryption<E>,
+        decryption_base: E::G1,
+        ciphertext_digest: &[u8; 32],
+        public_key: &LagPublicKey<E>,
+        crs: &CRS<E>,
+        rng: &mut impl RngCore,
+    ) -> PartialDecryptionProof<E> {
+        assert_eq!(
+            self.id, public_key.id,
+            "partial decryption proof must use the prover's public key"
+        );
+        assert!(
+            valid_partial_decryption_statement(partial_decryption, public_key, crs),
+            "invalid partial decryption proof statement"
+        );
+
+        let r = E::ScalarField::rand(rng);
+        let commitments = PartialDecryptionCommitments {
+            a_pk: crs.gen_g[0] * r,
+            a_pd: decryption_base * r,
+        };
+        let challenge = partial_decryption_challenge(
+            partial_decryption,
+            decryption_base,
+            ciphertext_digest,
+            public_key,
+            crs,
+            &commitments,
+        );
+        let z_sk = r + challenge * self.sk;
+
+        PartialDecryptionProof { challenge, z_sk }
     }
 }
 
@@ -347,6 +618,7 @@ impl<E: Pairing> PublicKey<E> {
 mod tests {
     use super::*;
     use crate::ste::aggregate::AggregateKey;
+    use ark_ec::pairing::PairingOutput;
     type E = ark_bls12_381::Bls12_381;
     type F = ark_bls12_381::Fr;
 
@@ -432,5 +704,70 @@ mod tests {
         assert_eq!(computed_lag_pk.sk_li_minus0, lag_pk.sk_li_minus0);
         assert_eq!(computed_lag_pk.sk_li_x, lag_pk.sk_li_x);
         assert_eq!(computed_lag_pk.sk_li_lj_z, lag_pk.sk_li_lj_z);
+    }
+
+    #[test]
+    fn partial_decryption_proof_verifies() {
+        let mut rng = ark_std::test_rng();
+        let n = 8;
+        let l = 4;
+        let t = n / 2;
+        let crs = CRS::<E>::new(n, l, &mut rng);
+        let sk = (0..n)
+            .map(|i| SecretKey::<E>::new(&mut rng, i))
+            .collect::<Vec<_>>();
+        let pk = sk
+            .iter()
+            .enumerate()
+            .map(|(i, sk)| sk.get_lagrange_pk(i, &crs))
+            .collect::<Vec<_>>();
+        let (_ak, ek) = AggregateKey::<E>::new(pk.clone(), &crs);
+        let message = vec![PairingOutput::<E>::zero(); l];
+        let ct = crate::ste::encryption::encrypt(&ek, t, &crs, &message, &mut rng);
+
+        let (partial_decryption, proof) =
+            sk[0].partial_decryption_with_proof(&ct, &pk[0], &crs, &mut rng);
+
+        assert!(proof.verify(&partial_decryption, &ct, &pk[0], &crs));
+
+        let mut tampered_partial_decryption = partial_decryption.clone();
+        tampered_partial_decryption.pd += crs.gen_g[0];
+        assert!(!proof.verify(&tampered_partial_decryption, &ct, &pk[0], &crs));
+
+        let mut tampered_ct = ct.clone();
+        tampered_ct.sa1[1] += crs.gen_g[0];
+        assert!(!proof.verify(&partial_decryption, &tampered_ct, &pk[0], &crs));
+    }
+
+    #[test]
+    fn batch_partial_decryption_proof_verifies() {
+        let mut rng = ark_std::test_rng();
+        let n = 8;
+        let l = bte::encryption::NUM_CHUNKS;
+        let batch_size = 2;
+        let t = n / 2;
+        let bte_crs = bte::crs::CRS::<E>::new(batch_size, &mut rng);
+        let crs = CRS::<E>::new(n, l, &mut rng);
+        let sk = (0..n)
+            .map(|i| SecretKey::<E>::new(&mut rng, i))
+            .collect::<Vec<_>>();
+        let pk = sk
+            .iter()
+            .enumerate()
+            .map(|(i, sk)| sk.get_lagrange_pk(i, &crs))
+            .collect::<Vec<_>>();
+        let (_ak, ek) = AggregateKey::<E>::new(pk.clone(), &crs);
+        let cts = (0..batch_size)
+            .map(|i| bte::encryption::encrypt(i, &bte_crs, &crs, &ek, t, &mut rng))
+            .collect::<Vec<_>>();
+
+        let (partial_decryption, proof) =
+            sk[0].batch_partial_decryption_with_proof(&cts, &pk[0], &crs, &mut rng);
+
+        assert!(proof.verify_batch(&partial_decryption, &cts, &pk[0], &crs));
+
+        let mut tampered_cts = cts.clone();
+        tampered_cts[0].encrypted_key.sa1[1] += crs.gen_g[0];
+        assert!(!proof.verify_batch(&partial_decryption, &tampered_cts, &pk[0], &crs));
     }
 }

@@ -17,11 +17,7 @@ pub fn decrypt<E: Pairing>(
     agg_key: &ste::aggregate::AggregateKey<E>,
     markers: Markers<PairingOutput<E>>,
 ) {
-    dlog::assert_homomorphic_batch_safe(
-        ct.len(),
-        encryption::CHUNK_BITS,
-        dlog::DLOG_RANGE_BITS,
-    );
+    dlog::assert_homomorphic_batch_safe(ct.len(), encryption::CHUNK_BITS, dlog::DLOG_RANGE_BITS);
 
     let timer = start_timer!(|| "STE Decryption");
     let k_agg_ct = ct.iter().fold(
@@ -37,9 +33,9 @@ pub fn decrypt<E: Pairing>(
     let k_agg_chunks = k_agg_t
         .iter()
         .map(|y| {
-            markers.compute_dlog(y).expect(
-                "DLog lookup failed — exponent out of BSGS range",
-            )
+            markers
+                .compute_dlog(y)
+                .expect("DLog lookup failed — exponent out of BSGS range")
         })
         .collect::<Vec<_>>();
 
@@ -84,11 +80,7 @@ pub fn decrypt_fft<E: Pairing>(
     agg_key: &ste::aggregate::AggregateKey<E>,
     markers: Markers<PairingOutput<E>>,
 ) {
-    dlog::assert_homomorphic_batch_safe(
-        ct.len(),
-        encryption::CHUNK_BITS,
-        dlog::DLOG_RANGE_BITS,
-    );
+    dlog::assert_homomorphic_batch_safe(ct.len(), encryption::CHUNK_BITS, dlog::DLOG_RANGE_BITS);
 
     let timer = start_timer!(|| "STE Decryption");
     let k_agg_ct = ct.iter().fold(
@@ -103,9 +95,9 @@ pub fn decrypt_fft<E: Pairing>(
     let k_agg_chunks = k_agg_t
         .iter()
         .map(|y| {
-            markers.compute_dlog(y).expect(
-                "DLog lookup failed — exponent out of BSGS range",
-            )
+            markers
+                .compute_dlog(y)
+                .expect("DLog lookup failed — exponent out of BSGS range")
         })
         .collect::<Vec<_>>();
     let mut k_agg_scalar = E::ScalarField::zero();
@@ -197,13 +189,17 @@ pub mod tests {
         }
         end_timer!(timer);
 
-        let path = "markers_bsgs_decrypt_test.bin";
+        let path = format!(
+            "markers_bsgs_decrypt_test_{}_{}.bin",
+            dlog::DLOG_RANGE_BITS,
+            dlog::DLOG_MARKER_BITS
+        );
         let timer = start_timer!(|| "loading markers");
-        let markers = if std::path::Path::new(path).exists() {
-            Markers::<PairingOutput<E>>::read_from_file(path)
+        let markers = if std::path::Path::new(&path).exists() {
+            Markers::<PairingOutput<E>>::read_from_file(&path)
         } else {
             let m = Markers::<PairingOutput<E>>::new();
-            m.save_to_file(path);
+            m.save_to_file(&path);
             m
         };
         end_timer!(timer);

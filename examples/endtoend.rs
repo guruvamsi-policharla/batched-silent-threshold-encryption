@@ -14,10 +14,8 @@ fn run_benchmark(batch_size: usize) {
     let n = 1 << 7;
     let l = NUM_CHUNKS;
     debug_assert!(
-        batch_size <= dlog::max_homomorphic_batch_size(
-            bte::encryption::CHUNK_BITS,
-            dlog::DLOG_RANGE_BITS
-        ),
+        batch_size
+            <= dlog::max_homomorphic_batch_size(bte::encryption::CHUNK_BITS, dlog::DLOG_RANGE_BITS),
         "batch_size exceeds BSGS DLog range"
     );
     let t: usize = n / 2;
@@ -57,10 +55,11 @@ fn run_benchmark(batch_size: usize) {
     end_timer!(timer);
 
     let timer = start_timer!(|| "Computing Partial Decryptions");
-    let agg_ct = cts.iter().fold(
-        ste::encryption::Ciphertext::<E>::zero(l, t),
-        |acc, c| acc.add(&c.encrypted_key),
-    );
+    let agg_ct = cts
+        .iter()
+        .fold(ste::encryption::Ciphertext::<E>::zero(l, t), |acc, c| {
+            acc.add(&c.encrypted_key)
+        });
     let mut partial_decryptions: Vec<ste::setup::PartialDecryption<E>> = Vec::new();
     for i in 0..t {
         partial_decryptions.push(sk[i].partial_decryption(&agg_ct));
@@ -71,13 +70,17 @@ fn run_benchmark(batch_size: usize) {
     let selector: Vec<bool> = (0..n).map(|i| i < t).collect();
     end_timer!(timer);
 
-    let path = "markers_bsgs.bin";
-    let markers = if std::path::Path::new(path).exists() {
-        Markers::<PairingOutput<E>>::read_from_file(path)
+    let path = format!(
+        "markers_bsgs_{}_{}.bin",
+        dlog::DLOG_RANGE_BITS,
+        dlog::DLOG_MARKER_BITS
+    );
+    let markers = if std::path::Path::new(&path).exists() {
+        Markers::<PairingOutput<E>>::read_from_file(&path)
     } else {
         println!("Markers file not found, generating new markers...");
         let m = Markers::<PairingOutput<E>>::new();
-        m.save_to_file(path);
+        m.save_to_file(&path);
         m
     };
 

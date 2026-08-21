@@ -5,14 +5,21 @@ use std::marker::PhantomData;
 
 /// Maximum exponent the BSGS solver can handle: inputs must be in `[0, 2^DLOG_RANGE_BITS)`.
 ///
-/// With `CHUNK_BITS = 16` this supports up to `floor((2^25 − 1) / (2^16 − 1)) = 512` ciphertexts
-/// summed homomorphically per STE slot.
+/// The range follows the active chunk feature. `chunks-16` keeps the original
+/// 25-bit range, while `chunks-8` uses 41 bits so 512 32-bit chunks can be
+/// summed homomorphically.
+#[cfg(feature = "chunks-16")]
 pub const DLOG_RANGE_BITS: usize = 25;
+#[cfg(feature = "chunks-8")]
+pub const DLOG_RANGE_BITS: usize = 41;
 
-/// Number of giant-step markers stored in the table (`2^13 = 8192`).
+/// Number of giant-step markers stored in the table.
+#[cfg(feature = "chunks-16")]
 pub const DLOG_MARKER_BITS: usize = 13;
+#[cfg(feature = "chunks-8")]
+pub const DLOG_MARKER_BITS: usize = 20;
 
-/// Number of baby steps at solve time (`2^12 = 4096`).  Must equal `DLOG_RANGE_BITS - DLOG_MARKER_BITS`.
+/// Number of baby steps at solve time. Must equal `DLOG_RANGE_BITS - DLOG_MARKER_BITS`.
 pub const DLOG_STEP_BITS: usize = DLOG_RANGE_BITS - DLOG_MARKER_BITS;
 
 /// Byte width for hash-map keys: first 16 bytes of the uncompressed point serialization.
@@ -112,8 +119,7 @@ impl<G: PrimeGroup> Markers<G> {
         let step = G::generator() * G::ScalarField::from(1u64 << log_bases);
         let mut marker = G::zero();
         let num_markers = (1usize << log_markers) + 1;
-        let mut markers_map =
-            std::collections::HashMap::with_capacity(num_markers);
+        let mut markers_map = std::collections::HashMap::with_capacity(num_markers);
         let mut buf = Vec::with_capacity(1024);
 
         markers_map.insert(point_key_into(&marker, &mut buf), 0);
@@ -178,17 +184,20 @@ mod tests {
 
     #[test]
     fn test_compute_dlog() {
-        let path = "markers_bsgs_test.bin";
+        let path = format!(
+            "markers_bsgs_test_{}_{}.bin",
+            DLOG_RANGE_BITS, DLOG_MARKER_BITS
+        );
 
         let should_be_dlog = Fr::from(100u64);
         let target = GT::generator() * should_be_dlog;
 
         let timer = start_timer!(|| "loading markers");
-        let markers = if std::path::Path::new(path).exists() {
-            Markers::<GT>::read_from_file(path)
+        let markers = if std::path::Path::new(&path).exists() {
+            Markers::<GT>::read_from_file(&path)
         } else {
             let m = Markers::<GT>::new();
-            m.save_to_file(path);
+            m.save_to_file(&path);
             m
         };
         end_timer!(timer);
@@ -209,7 +218,13 @@ mod tests {
 
     #[test]
     fn max_batch_with_bsgs() {
-        assert_eq!(max_homomorphic_batch_size(16, DLOG_RANGE_BITS), 512);
-        assert_eq!(max_homomorphic_batch_size(8, DLOG_RANGE_BITS), 131_586);
+        assert_eq!(
+            max_homomorphic_batch_size(crate::bte::encryption::CHUNK_BITS, DLOG_RANGE_BITS),
+            512
+        );
+        assert_eq!(
+            max_homomorphic_batch_size(8, DLOG_RANGE_BITS),
+            (max_dlog_exponent(DLOG_RANGE_BITS) / max_chunk_value(8)) as usize
+        );
     }
 }

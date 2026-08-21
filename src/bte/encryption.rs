@@ -7,12 +7,24 @@ use ark_ec::PrimeGroup;
 use ark_ff::PrimeField;
 use ark_std::{rand::Rng, Zero};
 
+#[cfg(all(feature = "chunks-8", feature = "chunks-16"))]
+compile_error!("features `chunks-8` and `chunks-16` are mutually exclusive");
+
+#[cfg(not(any(feature = "chunks-8", feature = "chunks-16")))]
+compile_error!("enable exactly one chunk parameter feature: `chunks-8` or `chunks-16`");
+
 /// Bits per STE / GT chunk when decomposing the PRF scalar (must match `ste_crs.l`).
 /// Each chunk limb is in `[0, 2^CHUNK_BITS − 1]`. After homomorphically summing `B` ciphertexts,
 /// a slot sum is at most `B · (2^CHUNK_BITS − 1)`; see [`crate::dlog::max_homomorphic_batch_size`].
+#[cfg(feature = "chunks-16")]
 pub const CHUNK_BITS: u32 = 16;
+#[cfg(feature = "chunks-8")]
+pub const CHUNK_BITS: u32 = 32;
 /// Number of chunks; `CHUNK_BITS * NUM_CHUNKS` must cover the scalar field (~255 bits for BLS12-381).
+#[cfg(feature = "chunks-16")]
 pub const NUM_CHUNKS: usize = 16;
+#[cfg(feature = "chunks-8")]
+pub const NUM_CHUNKS: usize = 8;
 
 #[derive(Clone, Debug)]
 pub struct Ciphertext<E: Pairing> {
@@ -20,6 +32,12 @@ pub struct Ciphertext<E: Pairing> {
     // encrypt key under the threshold scheme
     pub encrypted_key: crate::ste::encryption::Ciphertext<E>,
     pub mask: PairingOutput<E>, // todo: message masked with bytes
+}
+
+#[derive(Clone, Debug)]
+pub struct EncryptionWitness<E: Pairing> {
+    pub chunks: Vec<E::ScalarField>,
+    pub ste_randomness: ste::encryption::EncryptionRandomness<E>,
 }
 
 /// Sample a key, puncture it at position, and mask message at that evaluation point.
@@ -31,6 +49,18 @@ pub fn encrypt<E: Pairing>(
     t: usize,
     rng: &mut impl Rng,
 ) -> Ciphertext<E> {
+    encrypt_with_witness(position, bte_crs, ste_crs, ek, t, rng).0
+}
+
+/// Same as [`encrypt`], but also returns the witness needed by the CCA validity proof.
+pub fn encrypt_with_witness<E: Pairing>(
+    position: usize,
+    bte_crs: &bte::crs::CRS<E>,
+    ste_crs: &ste::crs::CRS<E>,
+    ek: &EncryptionKey<E>,
+    t: usize,
+    rng: &mut impl Rng,
+) -> (Ciphertext<E>, EncryptionWitness<E>) {
     let prf = PRF::<E>::new(rng);
     let pprf = prf.puncture(position, &bte_crs);
 
@@ -48,13 +78,21 @@ pub fn encrypt<E: Pairing>(
     let chunks_t = chunks.iter().map(|c| gen_t * c).collect::<Vec<_>>();
 
     // encrypt the key using the STE encryption scheme
-    let encrypted_key = ste::encryption::encrypt(&ek, t, &ste_crs, &chunks_t, rng);
+    let (encrypted_key, ste_randomness) =
+        ste::encryption::encrypt_with_witness(&ek, t, &ste_crs, &chunks_t, rng);
 
-    Ciphertext {
+    let ciphertext = Ciphertext {
         pprf,
         encrypted_key,
         mask: prf.eval(position, &bte_crs),
-    }
+    };
+    (
+        ciphertext,
+        EncryptionWitness {
+            chunks,
+            ste_randomness,
+        },
+    )
 }
 
 #[cfg(test)]

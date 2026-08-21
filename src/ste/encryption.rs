@@ -11,6 +11,11 @@ use ark_std::Zero;
 use serde::{Deserialize, Serialize};
 use std::ops::Mul;
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct EncryptionRandomness<E: Pairing> {
+    pub s: [E::ScalarField; 5],
+}
+
 #[derive(
     Debug, CanonicalSerialize, CanonicalDeserialize, Serialize, Deserialize, Clone, PartialEq,
 )]
@@ -65,12 +70,39 @@ pub fn encrypt<E: Pairing>(
     m: &Vec<PairingOutput<E>>,
     rng: &mut impl Rng,
 ) -> Ciphertext<E> {
+    encrypt_with_witness(ek, t, crs, m, rng).0
+}
+
+pub fn encrypt_with_witness<E: Pairing>(
+    ek: &EncryptionKey<E>,
+    t: usize,
+    crs: &CRS<E>,
+    m: &Vec<PairingOutput<E>>,
+    rng: &mut impl Rng,
+) -> (Ciphertext<E>, EncryptionRandomness<E>) {
+    let randomness = EncryptionRandomness {
+        s: [
+            E::ScalarField::rand(rng),
+            E::ScalarField::rand(rng),
+            E::ScalarField::rand(rng),
+            E::ScalarField::rand(rng),
+            E::ScalarField::rand(rng),
+        ],
+    };
+    let ciphertext = encrypt_with_randomness(ek, t, crs, m, &randomness);
+    (ciphertext, randomness)
+}
+
+pub fn encrypt_with_randomness<E: Pairing>(
+    ek: &EncryptionKey<E>,
+    t: usize,
+    crs: &CRS<E>,
+    m: &Vec<PairingOutput<E>>,
+    randomness: &EncryptionRandomness<E>,
+) -> Ciphertext<E> {
     let mut sa1 = [E::G1::generator(); 2];
     let mut sa2 = [E::G2::generator(); 6];
-
-    let s = (0..5)
-        .map(|_| E::ScalarField::rand(rng))
-        .collect::<Vec<_>>();
+    let s = &randomness.s;
 
     // s[0] = E::ScalarField::zero();
     // s[1] = E::ScalarField::zero();
